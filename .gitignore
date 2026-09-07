@@ -1,0 +1,37 @@
+# Zig build artifacts
+.zig-cache/
+zig-out/
+bin/
+
+# Compiled binaries
+*.exe
+*.dll
+*.so
+*.dylib
+*.pdb
+*.ilk
+*.exp
+*.lib
+
+# Local data files (event store databases)
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+
+# Test output
+*.test
+*.out
+test.log
+build.log
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Vendored SQLite amalgamation (uncomment if you choose to NOT vendor it)
+# vendor/sqlite/c/sqlite3.c
+# vendor/sqlite/c/sqlite3.h
