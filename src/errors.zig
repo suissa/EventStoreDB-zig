@@ -37,6 +37,9 @@ pub const Error = error{
     InvalidArgument,
     /// A query yielded no rows where at least one was expected.
     NotFound,
+    /// `sqlite3_prepare_v2` returned SQLITE_OK but the handle
+    /// is null (defensive — should not happen in practice).
+    PrepareFailed,
     /// Catch-all for a SQLite C API call that returned an error
     /// code other than the ones we map explicitly. The raw
     /// `sqlite3_*errmsg` is included in the `message` field.
@@ -53,13 +56,9 @@ pub const WrongExpectedVersionError = struct {
     stream: []const u8,
 
     pub fn format(
-        self: WrongExpectedVersionError,
-        comptime fmt: []const u8,
-        options: std.fmt.FormatOptions,
-        writer: anytype,
-    ) !void {
-        _ = fmt;
-        _ = options;
+        self: *const WrongExpectedVersionError,
+        writer: *std.Io.Writer,
+    ) std.Io.Writer.Error!void {
         try writer.print(
             "wrong expected version for stream {s} (expected {s}, actual {d})",
             .{ self.stream, self.expected, self.actual },

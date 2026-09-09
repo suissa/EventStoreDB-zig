@@ -21,7 +21,10 @@ pub fn readStream(
     const limit: u32 = if (opts.limit == 0) self.max_batch_size else opts.limit;
     if (try isTombstoned(self.conn, stream_id)) return error.StreamTombstoned;
 
-    const from_rev = try resolveFromRevision(self, stream_id, opts.from);
+    const from_rev = try resolveFromRevision(self, stream_id, switch (opts.from) {
+        .start => if (opts.direction == .backward) .start_backward else .start,
+        else => opts.from,
+    });
 
     const sql = if (opts.direction == .backward)
         \\SELECT event_id, stream_id, event_number, log_position, transaction_position,
@@ -58,14 +61,24 @@ pub fn readAll(
     const limit: u32 = if (opts.limit == 0) self.max_batch_size else opts.limit;
     const from_pos = resolveFromPosition(opts.from, self.lastLogPosition());
 
-    const sql = if (opts.direction == .backward)
+    // A `Position{commit=N, prepare=N}` is the position *of* the
+    // next unread event. To start reading *at* the next event
+    // (i.e. skip everything strictly before it) we use
+    // `log_position > N`. The exception is `.start_of_log`,
+    // which is `{commit=0, prepare=0}` and is the sentinel for
+    // "from the beginning", so we use `>= 0`.
+    const min_pos: i64 = if (from_pos.commit == 0 and from_pos.prepare == 0) 0 else @intCast(from_pos.commit);
+    const use_strict: bool = from_pos.commit != 0 or from_pos.prepare != 0;
+
+    const sql_strict =
         \\SELECT event_id, stream_id, event_number, log_position, transaction_position,
         \\       event_type, data, metadata
         \\FROM events
-        \\WHERE log_position <= ?
-        \\ORDER BY log_position DESC
+        \\WHERE log_position > ?
+        \\ORDER BY log_position ASC
         \\LIMIT ?
-    else
+    ;
+    const sql_loose =
         \\SELECT event_id, stream_id, event_number, log_position, transaction_position,
         \\       event_type, data, metadata
         \\FROM events
@@ -73,10 +86,11 @@ pub fn readAll(
         \\ORDER BY log_position ASC
         \\LIMIT ?
     ;
+    const sql: []const u8 = if (use_strict) sql_strict else sql_loose;
 
     const stmt = try bind.prepare(self.conn.db, self.conn.allocator, sql);
     defer bind.finalize(self.conn.allocator, stmt);
-    _ = bind.bindI64(stmt, 1, @intCast(@as(i64, @intCast(from_pos.commit))));
+    _ = bind.bindI64(stmt, 1, min_pos);
     _ = bind.bindI64(stmt, 2, @intCast(@as(i64, @intCast(limit))));
 
     return collectPage(allocator, stmt, limit, opts.direction == .backward, false);
@@ -89,11 +103,11 @@ fn collectPage(
     backward: bool,
     has_stream: bool,
 ) (errors_mod.Error || std.mem.Allocator.Error)!types.ReadResult {
-    var events = try std.ArrayList(types.RecordedEvent).initCapacity(allocator, 16);
-    defer events.deinit();
+    var events = try std.ArrayListAligned(types.RecordedEvent, null).initCapacity(allocator, 16);
+    defer events.deinit(allocator);
 
     while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
-        try events.append(try scanEvent(allocator, stmt));
+        try events.append(allocator, try scanEvent(allocator, stmt));
     }
 
     if (events.items.len == 0) {
@@ -120,7 +134,7 @@ fn collectPage(
     _ = has_stream;
 
     return .{
-        .events = try events.toOwnedSlice(),
+        .events = try events.toOwnedSlice(allocator),
         .next_revision = next_rev,
         .next_position = next_pos,
         .is_end_of_stream = is_end,
@@ -153,15 +167,19 @@ fn scanEvent(allocator: std.mem.Allocator, stmt: *c.sqlite3_stmt) (errors_mod.Er
 }
 
 fn dupText(allocator: std.mem.Allocator, stmt: *c.sqlite3_stmt, col: c_int) std.mem.Allocator.Error![]const u8 {
-    const len = c.sqlite3_column_bytes(stmt, col);
-    const ptr: [*]const u8 = @ptrCast(c.sqlite3_column_text(stmt, col));
-    return allocator.dupe(u8, ptr[0..@intCast(len)]);
+    const len: usize = @intCast(c.sqlite3_column_bytes(stmt, col));
+    if (len == 0) return &[_]u8{};
+    const ptr_opt: ?[*]const u8 = @ptrCast(c.sqlite3_column_text(stmt, col));
+    const ptr = ptr_opt orelse return &[_]u8{};
+    return allocator.dupe(u8, ptr[0..len]);
 }
 
 fn dupBlob(allocator: std.mem.Allocator, stmt: *c.sqlite3_stmt, col: c_int) std.mem.Allocator.Error![]const u8 {
-    const len = c.sqlite3_column_bytes(stmt, col);
-    const ptr: [*]const u8 = @ptrCast(c.sqlite3_column_blob(stmt, col));
-    return allocator.dupe(u8, ptr[0..@intCast(len)]);
+    const len: usize = @intCast(c.sqlite3_column_bytes(stmt, col));
+    if (len == 0) return &[_]u8{};
+    const ptr_opt: ?[*]const u8 = @ptrCast(c.sqlite3_column_blob(stmt, col));
+    const ptr = ptr_opt orelse return &[_]u8{};
+    return allocator.dupe(u8, ptr[0..len]);
 }
 
 fn isTombstoned(conn: *schema_mod.Connection, stream_id: []const u8) !bool {
@@ -173,11 +191,26 @@ fn isTombstoned(conn: *schema_mod.Connection, stream_id: []const u8) !bool {
 }
 
 fn resolveFromRevision(self: *Client, stream_id: []const u8, from: types.From) !i64 {
+    _ = stream_id;
     switch (from) {
         .start => return 0,
+        // For backward reads, "from start" means "from the end of
+        // the log" — i.e. no upper bound. Use a large positive
+        // value that exceeds any real revision.
+        .start_backward => return std.math.maxInt(i64),
         .end => {
-            _ = stream_id;
-            const v = try @import("client.zig").scalarI64(self.conn, "SELECT revision FROM streams WHERE stream_id = ?");
+            const v = @import("client.zig").scalarI64(
+                self.conn,
+                "SELECT revision FROM streams WHERE stream_id = ?",
+            ) catch |err| switch (err) {
+                // Stream does not exist: there are no events
+                // past the end, so a read from end returns no
+                // rows. We return `0` so the SQL `event_number <= 0`
+                // matches no event with a 0-based index, and the
+                // `is_end_of_stream` short-circuit fires.
+                error.NotFound => return 0,
+                else => return err,
+            };
             return v + 1;
         },
         .revision => |r| return @intCast(r),
@@ -187,8 +220,8 @@ fn resolveFromRevision(self: *Client, stream_id: []const u8, from: types.From) !
 
 fn resolveFromPosition(from: types.From, last_log: u64) types.Position {
     return switch (from) {
-        .start, .position => .start_of_log,
+        .start, .start_backward, .revision => .start_of_log,
+        .position => |p| p,
         .end => .{ .commit = last_log + 1, .prepare = last_log + 1 },
-        .revision => .start_of_log,
     };
 }

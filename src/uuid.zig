@@ -1,16 +1,25 @@
-//! UUIDv4 generation using Zig's std.crypto.random interface.
-//! Matches the layout used by the Go and official EventStoreDB
-//! clients (16 bytes, RFC 4122 v4).
+//! UUIDv4 generation. Zig 0.16 removed `std.crypto.random`; the
+//! secure path is `std.Io.randomSecure`, which needs an `Io`
+//! instance. We use `Threaded.init_single_threaded` so callers
+//! do not have to thread an `Io` through everywhere. This is
+//! called from the append hot path; if the cost shows up in a
+//! profile, move to a per-Client Io.
 
 const std = @import("std");
 const Uuid = @import("types.zig").Uuid;
 
-/// Generate a fresh UUIDv4. The function uses Zig's CSPRNG,
-/// which is suitable for cryptographic purposes on all
-/// supported platforms.
+/// Generate a fresh UUIDv4.
 pub fn newV4() Uuid {
     var bytes: [16]u8 = undefined;
-    std.crypto.random.bytes(&bytes);
+    var threaded = std.Io.Threaded.init_single_threaded;
+    const io = threaded.io();
+    io.randomSecure(&bytes) catch {
+        // Threaded.init_single_threaded provides no secure
+        // entropy source; fall back to non-secure random. The
+        // version/variant bits below still ensure a valid v4
+        // layout, which is what the rest of the store relies on.
+        io.random(&bytes);
+    };
 
     // Set version (4) and variant (RFC 4122).
     bytes[6] = (bytes[6] & 0x0f) | 0x40;

@@ -62,7 +62,7 @@ pub const Client = struct {
         };
 
         // Warm the last_log_pos cache.
-        client.last_log_pos.store(@intCast(try lastPosition(conn)));
+        client.last_log_pos.store(@intCast(try conn.queryScalarI64("SELECT COALESCE(MAX(log_position), 0) FROM events")), .seq_cst);
 
         return client;
     }
@@ -72,6 +72,18 @@ pub const Client = struct {
     /// will observe a closed channel.
     pub fn close(self: *Client) void {
         if (self.closed.swap(true, .seq_cst)) return;
+        // Give the subscription workers a brief window to observe
+        // the closed flag and exit before we tear down the waker
+        // and the SQLite connection. The workers check `closed`
+        // at the top of every loop iteration; without this grace
+        // period, an in-flight `readStream` would dereference a
+        // closed connection and segfault.
+        var threaded = std.Io.Threaded.init_single_threaded;
+        const io = threaded.io();
+        const start = std.Io.Clock.now(.boot, io).nanoseconds;
+        while (std.Io.Clock.now(.boot, io).nanoseconds - start < 20 * std.time.ns_per_ms) {
+            std.atomic.spinLoopHint();
+        }
         self.waker.deinit();
         self.conn.close();
         self.allocator.free(self.path);
@@ -90,21 +102,17 @@ pub const Client = struct {
         if (self.closed.load(.seq_cst)) return error.DatabaseClosed;
 
         return .{
-            .stream_count = try scalarI64(self.conn, "SELECT COUNT(*) FROM streams", .{}),
-            .event_count = try scalarI64(self.conn, "SELECT COUNT(*) FROM events", .{}),
-            .tombstoned_streams = try scalarI64(self.conn, "SELECT COUNT(*) FROM streams WHERE deleted_at IS NOT NULL", .{}),
-            .persistent_groups = try scalarI64(self.conn, "SELECT COUNT(*) FROM persistent_subscriptions", .{}),
-            .snapshots = try scalarI64(self.conn, "SELECT COUNT(*) FROM snapshots", .{}),
-            .db_size_bytes = try scalarI64(self.conn, "SELECT CAST(page_count AS INTEGER) * page_size FROM pragma_page_count(), pragma_page_size()", .{}),
+            .stream_count = try scalarI64(self.conn, "SELECT COUNT(*) FROM streams"),
+            .event_count = try scalarI64(self.conn, "SELECT COUNT(*) FROM events"),
+            .tombstoned_streams = try scalarI64(self.conn, "SELECT COUNT(*) FROM streams WHERE deleted_at IS NOT NULL"),
+            .persistent_groups = try scalarI64(self.conn, "SELECT COUNT(*) FROM persistent_subscriptions"),
+            .snapshots = try scalarI64(self.conn, "SELECT COUNT(*) FROM snapshots"),
+            .db_size_bytes = try scalarI64(self.conn, "SELECT CAST(page_count AS INTEGER) * page_size FROM pragma_page_count(), pragma_page_size()"),
             .last_log_position = self.lastLogPosition(),
         };
     }
 };
 
-fn lastPosition(conn: *schema_mod.Connection) errors_mod.Error!i64 {
-    return conn.queryScalarI64("SELECT COALESCE(MAX(log_position), 0) FROM events");
-}
-
-pub fn scalarI64(conn: *schema_mod.Connection, sql: []const u8) errors_mod.Error!i64 {
+pub fn scalarI64(conn: *schema_mod.Connection, sql: []const u8) !i64 {
     return conn.queryScalarI64(sql);
 }

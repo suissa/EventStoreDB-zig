@@ -1,0 +1,47 @@
+const std = @import("std");
+const c = @import("c").c;
+const schema_mod = @import("schema.zig");
+
+pub fn main() !void {
+    var gpa_state = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa_state.deinit();
+    const a = gpa_state.allocator();
+
+    const conn = try schema_mod.Connection.open(a, ":memory:", 5000);
+    defer conn.close();
+
+    // Try the same INSERT insertEvent does.
+    const sql =
+        \\INSERT INTO events(event_id, stream_id, event_number, log_position, transaction_position, event_type, data, metadata, created_at)
+        \\VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ;
+    const stmt_z = try a.dupeZ(u8, sql);
+    defer a.free(stmt_z);
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(conn.db, stmt_z.ptr, -1, &stmt, null) != c.SQLITE_OK) {
+        std.debug.print("prepare failed: {s}\n", .{c.sqlite3_errmsg(conn.db)});
+        return;
+    }
+    defer _ = c.sqlite3_finalize(stmt.?);
+
+    var event_id: [16]u8 = .{1} ++ .{0} ** 15;
+    const stream_id_z = try a.dupeZ(u8, "s1");
+    defer a.free(stream_id_z);
+    const event_type_z = try a.dupeZ(u8, "TestType");
+    defer a.free(event_type_z);
+    const data_z = try a.dupeZ(u8, "{}");
+    defer a.free(data_z);
+
+    _ = c.sqlite3_bind_blob(stmt, 1, &event_id, 16, c.SQLITE_TRANSIENT);
+    _ = c.sqlite3_bind_text(stmt, 2, stream_id_z.ptr, 2, c.SQLITE_TRANSIENT);
+    _ = c.sqlite3_bind_int64(stmt, 3, 0);
+    _ = c.sqlite3_bind_int64(stmt, 4, 1);
+    _ = c.sqlite3_bind_int64(stmt, 5, 1);
+    _ = c.sqlite3_bind_text(stmt, 6, event_type_z.ptr, 8, c.SQLITE_TRANSIENT);
+    _ = c.sqlite3_bind_blob(stmt, 7, data_z.ptr, 2, c.SQLITE_TRANSIENT);
+    _ = c.sqlite3_bind_null(stmt, 8);
+    _ = c.sqlite3_bind_int64(stmt, 9, 1234567890);
+
+    const rc = c.sqlite3_step(stmt);
+    std.debug.print("step rc={d} msg={s}\n", .{ rc, c.sqlite3_errmsg(conn.db) });
+}

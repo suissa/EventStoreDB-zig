@@ -26,15 +26,15 @@ pub fn listStreams(
     _ = bind.bindI64(stmt, 1, @intCast(@as(i64, @intCast(lim))));
     _ = bind.bindI64(stmt, 2, @intCast(@as(i64, @intCast(offset))));
 
-    var out = try std.ArrayList(types.StreamInfo).initCapacity(allocator, 8);
-    defer out.deinit();
+    var out = try std.ArrayListAligned(types.StreamInfo, null).initCapacity(allocator, 8);
+    defer out.deinit(allocator);
     while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
         const id = try dupText(allocator, stmt, 0);
         const rev: u64 = @intCast(c.sqlite3_column_int64(stmt, 1));
         const max: i64 = c.sqlite3_column_int64(stmt, 2);
         const trunc: u64 = @intCast(c.sqlite3_column_int64(stmt, 3));
         const deleted = c.sqlite3_column_type(stmt, 4) != c.SQLITE_NULL;
-        try out.append(.{
+        try out.append(allocator, .{
             .stream_id = id,
             .revision = rev,
             .max_count = max,
@@ -42,7 +42,7 @@ pub fn listStreams(
             .deleted = deleted,
         });
     }
-    return out.toOwnedSlice();
+    return out.toOwnedSlice(allocator);
 }
 
 pub fn getStreamInfo(
@@ -187,7 +187,7 @@ pub fn loadProjectionState(
     );
     defer bind.finalize(self.conn.allocator, stmt);
     _ = bind.bindText(stmt, 1, name);
-    if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.StreamNotFound;
+    if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.NotFound;
 
     const nm = try dupText(allocator, stmt, 0);
     const pos: u64 = @intCast(c.sqlite3_column_int64(stmt, 1));

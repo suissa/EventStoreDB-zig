@@ -3,21 +3,25 @@
 //
 //   zig build examples
 //   ./zig-out/examples/basic
+//
+// Note: operations on the client are namespace functions in
+// the `esdb` module, not methods. Use `esdb.appendToStream(c, ...)`.
 
 const std = @import("std");
 const esdb = @import("eventstoredb");
 
-pub fn main(_: std.process.Init.Minimal) !void {
-    var gpa = std.heap.DebugAllocator(.{}){.init;
+pub fn main(init: std.process.Init) !void {
+    var gpa = std.heap.DebugAllocator(.{}).init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
+    _ = init;
 
     var client = try esdb.Client.open(allocator, .{ .path = ":memory:" });
     defer client.close();
 
     const stream_id = "orders-1";
 
-    const result = try client.appendToStream(allocator, stream_id,
+    const result = try esdb.appendToStream(allocator, client, stream_id,
         .{ .expected_revision = .no_stream },
         &[_]esdb.EventData{
             .{ .event_type = "OrderCreated", .data = "{\"id\":\"1\",\"total\":99.90}" },
@@ -30,7 +34,7 @@ pub fn main(_: std.process.Init.Minimal) !void {
     const w = std.io.getStdOut().writer();
     try w.print("created stream; next revision: {d}, log pos: {d}\n", .{ result.next_revision, result.log_position });
 
-    const page = try client.readStream(allocator, stream_id, .{});
+    const page = try esdb.readStream(allocator, client, stream_id, .{});
     defer allocator.free(page.events);
     for (page.events) |ev| {
         try w.print("  rev={d}  pos={d}  type={s:<16}  data={s}\n", .{
@@ -44,4 +48,3 @@ pub fn main(_: std.process.Init.Minimal) !void {
     const stats = try client.stats();
     try w.print("stats: streams={d} events={d} size={d} bytes\n", .{ stats.stream_count, stats.event_count, stats.db_size_bytes });
 }
-

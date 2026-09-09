@@ -88,6 +88,11 @@ pub const ReadDirection = enum { forward, backward };
 pub const From = union(enum) {
     /// From the very first event (or end, for backward reads).
     start: void,
+    /// Internal marker: used by `readStream` to mean "read all
+    /// events in reverse" without an upper bound. Not part of the
+    /// public API; callers should pass `.start` and let the
+    /// library pick the right bound based on direction.
+    start_backward: void,
     /// Live from the current tip.
     end: void,
     /// Per-stream starting revision.
@@ -214,3 +219,66 @@ pub const OpenOptions = struct {
     /// Max concurrent connections. Default 4.
     max_connections: u32 = 4,
 };
+
+/// Item sent through a catch-up subscription's queue. The
+/// `err` variant is used to surface read failures, and `closed`
+/// is the sentinel emitted when the subscription is torn down.
+pub const RecordedEventOrErr = union(enum) {
+    event: RecordedEvent,
+    err: @import("errors.zig").Error,
+    closed: void,
+};
+
+/// Free a single `RecordedEvent` previously received by value
+/// from a subscription (via `Subscription.tryReceive`). Frees the
+/// `stream_id`, `event_type`, `data` and (if present) `metadata`
+/// slice, all allocated with the same allocator the subscription
+/// was created with.
+pub fn freeEvent(allocator: std.mem.Allocator, event: RecordedEvent) void {
+    allocator.free(event.stream_id);
+    allocator.free(event.event_type);
+    allocator.free(event.data);
+    if (event.metadata) |m| allocator.free(m);
+}
+
+/// Free a slice of `RecordedEvent` previously returned by
+/// `appendToStream`, `readStream`, `readAll`, or by the
+/// `subscribeTo*` family. Frees the outer slice and every owned
+/// `stream_id`, `event_type`, `data` and `metadata` slice on each
+/// row, all with the same allocator. Safe to call with an empty
+/// slice.
+pub fn freeEvents(allocator: std.mem.Allocator, events: []const RecordedEvent) void {
+    for (events) |e| {
+        allocator.free(e.stream_id);
+        allocator.free(e.event_type);
+        allocator.free(e.data);
+        if (e.metadata) |m| allocator.free(m);
+    }
+    allocator.free(events);
+}
+
+/// Free a slice of `Snapshot` previously returned by
+/// `loadSnapshot` (when batched). Frees the outer slice and
+/// every owned `stream_id`, `payload` and `metadata` slice.
+pub fn freeSnapshots(allocator: std.mem.Allocator, snaps: []const Snapshot) void {
+    for (snaps) |s| {
+        allocator.free(s.stream_id);
+        allocator.free(s.payload);
+        if (s.metadata) |m| allocator.free(m);
+    }
+    allocator.free(snaps);
+}
+
+/// Free a slice of `StreamInfo` previously returned by `listStreams`.
+/// Frees the outer slice and every owned `stream_id` slice.
+pub fn freeStreamInfo(allocator: std.mem.Allocator, infos: []const StreamInfo) void {
+    for (infos) |i| allocator.free(i.stream_id);
+    allocator.free(infos);
+}
+
+/// Free a single `ProjectionState` previously returned by
+/// `loadProjectionState`. Releases `name` and `state`.
+pub fn freeProjectionState(allocator: std.mem.Allocator, p: ProjectionState) void {
+    allocator.free(p.name);
+    if (p.state) |s| allocator.free(s);
+}

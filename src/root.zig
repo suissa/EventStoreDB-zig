@@ -42,6 +42,11 @@ pub const Uuid = types.Uuid;
 
 pub const Error = errors_mod.Error;
 pub const WrongExpectedVersionError = errors_mod.WrongExpectedVersionError;
+pub const freeEvents = types.freeEvents;
+pub const freeEvent = types.freeEvent;
+pub const freeSnapshots = types.freeSnapshots;
+pub const freeStreamInfo = types.freeStreamInfo;
+pub const freeProjectionState = types.freeProjectionState;
 
 pub const Subscription = @import("subscribe.zig").Subscription;
 pub const PersistentSubscription = @import("persistent.zig").PersistentSubscription;

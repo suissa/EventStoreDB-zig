@@ -5,6 +5,14 @@
 //
 // `stats` prints a JSON snapshot of the store.
 // `tail` streams live events (Ctrl-C to stop).
+//
+// Single-connection design: this CLI is intentionally one-shot.
+// `stats` opens one Client, runs one query, prints, exits.
+// `tail` opens one Client, runs one subscription, drains until
+// SIGINT, exits. There is no listener and no fan-out — the store
+// itself is shared via the SQLite file, not via a network socket.
+// If you need concurrent consumers, run multiple instances or
+// embed `eventstoredb-zig` as a library in your own process.
 // (The HTTP server is exposed as a library API; embed it in
 //  your own Zig program to serve over the network.)
 
@@ -102,9 +110,9 @@ fn runTail(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !
     defer client.close();
 
     var sub = if (stream) |s|
-        try client.subscribeToStream(allocator, s, .{ .from = .start, .buffer_size = 64 })
+        try esdb.subscribeToStream(client, allocator, s, .{ .from = .start, .buffer_size = 64 })
     else
-        try client.subscribeToAll(allocator, .{ .from = .start, .buffer_size = 64 });
+        try esdb.subscribeToAll(client, allocator, .{ .from = .start, .buffer_size = 64 });
     defer sub.close();
 
     while (sub.receive()) |next| {

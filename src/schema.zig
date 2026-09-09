@@ -6,6 +6,7 @@ const std = @import("std");
 const c = @import("c.zig").c;
 const errors = @import("errors.zig");
 const bind = @import("bind.zig");
+const time_mod = @import("time.zig");
 
 pub const Connection = struct {
     db: *c.sqlite3,
@@ -15,6 +16,11 @@ pub const Connection = struct {
     /// Open a SQLite database. The path can be ":memory:" for
     /// an in-memory database, or any SQLite-acceptable path.
     pub fn open(allocator: std.mem.Allocator, path: []const u8, busy_timeout_ms: u32) errors.Error!*Connection {
+        // Reject paths that embed a NUL byte: SQLite would silently truncate
+        // at the NUL via strlen, so we treat the path as invalid up front.
+        if (std.mem.indexOfScalar(u8, path, 0) != null) {
+            return errors.Error.CannotOpenDatabase;
+        }
         var db: ?*c.sqlite3 = null;
         // SQLite expects a nul-terminated path.
         const path_z = try allocator.dupeZ(u8, path);
@@ -82,7 +88,7 @@ pub const Connection = struct {
     }
 };
 
-const schemaVersion: u32 = 1;
+const schemaVersion: u32 = 2;
 
 const schemaSQL =
     \\CREATE TABLE IF NOT EXISTS streams (
@@ -108,12 +114,29 @@ const schemaSQL =
     \\  data                  BLOB NOT NULL,
     \\  metadata              BLOB,
     \\  created_at            INTEGER NOT NULL,
+    \\  -- DCB (Dynamic Consistency Boundary) columns.
+    \\  -- Nullable for legacy rows written before schema v2.
+    \\  -- `sequence` is the global, gap-free, append-only position
+    \\  -- used by the DCB read/append algorithm. `tags` is a JSON
+    \\  -- array of {key,value} pairs as described in the DCB spec;
+    \\  -- it is filterable with JSON_EXTRACT(tags, '$.<key>').
+    \\  -- `dc_time` is the wall-clock unix-ms used by DCB reads
+    \\  -- (created_at stays as the EventStoreDB-style timestamp).
+    \\  sequence              INTEGER,
+    \\  tags                  TEXT,
+    \\  dc_time               INTEGER,
     \\  PRIMARY KEY (stream_id, event_number)
     \\);
     \\CREATE INDEX IF NOT EXISTS idx_events_log_pos    ON events(log_position);
     \\CREATE INDEX IF NOT EXISTS idx_events_tx_pos     ON events(transaction_position);
     \\CREATE INDEX IF NOT EXISTS idx_events_type       ON events(event_type);
     \\CREATE INDEX IF NOT EXISTS idx_events_stream_rev ON events(stream_id, event_number);
+    \\-- DCB indexes (added in v2). Partial unique index keeps
+    \\-- legacy NULL sequence rows from clashing while still
+    \\-- enforcing uniqueness for new DCB writes.
+    \\CREATE UNIQUE INDEX IF NOT EXISTS idx_events_sequence
+    \\  ON events(sequence) WHERE sequence IS NOT NULL;
+    \\CREATE INDEX IF NOT EXISTS idx_events_tags ON events(tags);
     \\
     \\CREATE TABLE IF NOT EXISTS committed_event_ids (
     \\  event_id      BLOB PRIMARY KEY,
@@ -180,16 +203,68 @@ fn applyMigrations(conn: *Connection) errors.Error!void {
 
     var v: u32 = @intCast(current + 1);
     while (v <= schemaVersion) : (v += 1) {
-        // The base DDL above is idempotent, so v1 needs no
-        // further work. We still record the version in
-        // schema_info so the next migration can branch on it.
         try conn.exec("SAVEPOINT mig");
+        switch (v) {
+            1 => {
+                // v1: base DDL only. Already covered by the
+                // idempotent schemaSQL above; nothing extra
+                // to run inside the savepoint.
+            },
+            2 => {
+                // v2: DCB (Dynamic Consistency Boundary)
+                // columns. ALTER TABLE ADD COLUMN is not
+                // idempotent in SQLite, so we probe via
+                // PRAGMA table_info before issuing it.
+                try addColumnIfMissing(conn, "events", "sequence", "INTEGER");
+                try addColumnIfMissing(conn, "events", "tags", "TEXT");
+                try addColumnIfMissing(conn, "events", "dc_time", "INTEGER");
+                // Idempotent index DDL is safe to re-run.
+                try conn.exec(
+                    \\CREATE UNIQUE INDEX IF NOT EXISTS idx_events_sequence
+                    \\  ON events(sequence) WHERE sequence IS NOT NULL;
+                );
+                try conn.exec("CREATE INDEX IF NOT EXISTS idx_events_tags ON events(tags);");
+            },
+            else => {
+                // Future migrations branch here.
+            },
+        }
         try conn.exec("RELEASE mig");
-        try conn.execFmt("INSERT INTO schema_info(version, applied_at) VALUES ({d}, {d})", .{ v, std.time.timestamp() });
+        try conn.execFmt("INSERT INTO schema_info(version, applied_at) VALUES ({d}, {d})", .{ v, time_mod.nowSec() });
     }
+}
+
+/// SQLite has no IF NOT EXISTS for ADD COLUMN, so probe
+/// `PRAGMA table_info(<table>)` and only ALTER when the
+/// column is absent. Safe to call repeatedly.
+fn addColumnIfMissing(conn: *Connection, table: []const u8, column: []const u8, col_type: []const u8) errors.Error!void {
+    var buf: [256]u8 = undefined;
+    const pragma_sql = std.fmt.bufPrint(&buf, "PRAGMA table_info({s})", .{table}) catch return errors.Error.Sqlite;
+    const stmt = try bind.prepare(conn.db, conn.allocator, pragma_sql);
+    defer bind.finalize(conn.allocator, stmt);
+
+    var found = false;
+    while (true) {
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) break;
+        if (rc != c.SQLITE_ROW) return errors.Error.Sqlite;
+        const name = c.sqlite3_column_text(stmt, 1);
+        if (name == null) continue;
+        const name_slice = std.mem.span(name);
+        if (std.mem.eql(u8, name_slice, column)) {
+            found = true;
+            break;
+        }
+    }
+    if (found) return;
+
+    var alter_buf: [256]u8 = undefined;
+    const alter_sql = std.fmt.bufPrint(&alter_buf, "ALTER TABLE {s} ADD COLUMN {s} {s}", .{ table, column, col_type }) catch return errors.Error.Sqlite;
+    try conn.exec(alter_sql);
 }
 
 /// Current unix timestamp in milliseconds.
 pub fn nowMs() i64 {
-    return std.time.timestamp() * 1000;
+    return time_mod.nowMs();
 }
+

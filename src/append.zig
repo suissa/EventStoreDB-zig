@@ -27,6 +27,7 @@ pub fn appendToStream(
     events: []const types.EventData,
 ) (errors_mod.Error || std.mem.Allocator.Error)!types.AppendResult {
     if (self.closed.load(.seq_cst)) return error.DatabaseClosed;
+    if (self.closed.load(.seq_cst)) return error.DatabaseClosed;
     if (stream_id.len == 0) return error.InvalidArgument;
     if (events.len == 0) return error.InvalidArgument;
 
@@ -69,12 +70,16 @@ pub fn appendToStream(
         var last_tx: u64 = 0;
         for (prepared, 0..) |e, i| {
             const rec = existing_by_id.get(e.event_id).?;
+            // The lookupCommitted path already duped the slices
+            // with the caller's allocator, so we can hand them
+            // over directly. The caller frees them via
+            // `types.freeEvents`.
             recorded[i] = rec;
             if (rec.log_position > last_log) last_log = rec.log_position;
             if (rec.transaction_position > last_tx) last_tx = rec.transaction_position;
         }
         return .{
-            .next_revision = try currentRevision(self, stream_id) + 1,
+            .next_revision = @intCast(try currentRevision(self, stream_id) + 1),
             .log_position = last_log,
             .transaction_position = last_tx,
             .events = recorded,
@@ -94,14 +99,17 @@ pub fn appendToStream(
     const first_log = try nextLogPosition(conn);
     const tx_pos = try nextTxPosition(conn);
 
-    var recorded = try std.ArrayList(types.RecordedEvent).initCapacity(allocator, prepared.len);
-    defer recorded.deinit();
+    var recorded = try std.ArrayListAligned(types.RecordedEvent, null).initCapacity(allocator, prepared.len);
+    // On any error path, release every `owned_*` slice already in
+    // `recorded` and the outer backing array. `deinit` alone would
+    // leak the inner slices because `RecordedEvent` owns them.
+    errdefer types.freeEvents(allocator, recorded.items);
 
     var log_pos: u64 = first_log;
     var new_rev: i64 = curRev.revision;
     for (prepared) |e| {
         if (existing_by_id.get(e.event_id)) |existing| {
-            try recorded.append(existing);
+            try recorded.append(allocator, existing);
             continue;
         }
         new_rev += 1;
@@ -119,7 +127,7 @@ pub fn appendToStream(
             e.metadata,
             schema_mod.nowMs(),
         );
-        if (rc != c.SQLITE_OK) return error.Sqlite;
+        if (rc != c.SQLITE_OK and rc != c.SQLITE_DONE) return error.Sqlite;
 
         const rc2 = insertCommittedId(
             conn,
@@ -129,18 +137,40 @@ pub fn appendToStream(
             rev,
             schema_mod.nowMs(),
         );
-        if (rc2 != c.SQLITE_OK) return error.Sqlite;
+        if (rc2 != c.SQLITE_OK and rc2 != c.SQLITE_DONE) return error.Sqlite;
 
-        try recorded.append(.{
+        // Dup every input slice with the caller's allocator so
+        // the returned rows are uniformly caller-owned and the
+        // caller can free them with `types.freeEvents`. The
+        // `e.stream_id` argument lives in the caller's stack
+        // frame; we copy it here too so a subsequent mutation
+        // by the caller cannot affect what we already returned.
+        const owned_stream_id = try allocator.dupe(u8, stream_id);
+        const owned_event_type = try allocator.dupe(u8, e.event_type);
+        const owned_data = try allocator.dupe(u8, e.data);
+        const owned_metadata: ?[]const u8 = if (e.metadata) |m| try allocator.dupe(u8, m) else null;
+
+        // Once the item is in `recorded`, its owned_* slices are
+        // owned by the list and the function-level errdefer
+        // (`freeEvents(recorded.items)`) will reclaim them on
+        // any subsequent error. If `append` itself fails we have
+        // to free them by hand here.
+        recorded.append(allocator, .{
             .event_id = e.event_id,
-            .stream_id = stream_id,
-            .event_type = e.event_type,
-            .data = e.data,
-            .metadata = e.metadata,
+            .stream_id = owned_stream_id,
+            .event_type = owned_event_type,
+            .data = owned_data,
+            .metadata = owned_metadata,
             .revision = rev,
             .log_position = log_pos,
             .transaction_position = tx_pos,
-        });
+        }) catch |err| {
+            allocator.free(owned_stream_id);
+            allocator.free(owned_event_type);
+            allocator.free(owned_data);
+            if (owned_metadata) |m| allocator.free(m);
+            return err;
+        };
         log_pos += 1;
     }
 
@@ -161,7 +191,7 @@ pub fn appendToStream(
         .next_revision = @as(u64, @intCast(new_rev + 1)),
         .log_position = if (recorded.items.len > 0) recorded.items[recorded.items.len - 1].log_position else 0,
         .transaction_position = if (recorded.items.len > 0) recorded.items[recorded.items.len - 1].transaction_position else 0,
-        .events = try recorded.toOwnedSlice(),
+        .events = try recorded.toOwnedSlice(allocator),
     };
 }
 
@@ -216,10 +246,15 @@ fn nextTxPosition(conn: *schema_mod.Connection) !u64 {
 }
 
 fn checkExpectedRevision(exp: types.ExpectedRevision, current: i64, _: []const u8) errors_mod.Error!void {
+    // `current` is the stream's last written revision. The "expected"
+    // revision passed by the caller is the revision number the caller
+    // believes the *next* event will receive, which is last + 1 for
+    // a non-empty stream and 0 for an empty (or new) one.
+    const next: i64 = if (current < 0) 0 else current + 1;
     switch (exp) {
-        .no_stream => if (current >= 0) return error.WrongExpectedVersion,
+        .no_stream => if (next != 0) return error.WrongExpectedVersion,
         .stream_exists => if (current < 0) return error.WrongExpectedVersion,
-        .revision => |want| if (current != @as(i64, @intCast(want))) return error.WrongExpectedVersion,
+        .revision => |want| if (next != @as(i64, @intCast(want))) return error.WrongExpectedVersion,
         .any => {},
     }
 }
@@ -251,7 +286,8 @@ fn insertEvent(
     _ = bind.bindBlob(stmt, 7, data);
     _ = bind.bindOptionalBlob(stmt, 8, metadata);
     _ = bind.bindI64(stmt, 9, created_at);
-    return c.sqlite3_step(stmt);
+    const rc = c.sqlite3_step(stmt);
+    return rc;
 }
 
 fn insertCommittedId(
