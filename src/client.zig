@@ -15,6 +15,23 @@ pub const Client = struct {
     conn: *schema_mod.Connection,
     allocator: std.mem.Allocator,
 
+    /// Connection used by subscription workers (catch-up
+    /// `runStream`/`runAll` and persistent `runPS`).
+    ///
+    /// By default this is the same pointer as `conn` (the
+    /// writer connection); subscriptions and writers then
+    /// share one SQLite handle and contend under sustained
+    /// append load — see the v0.1 stress-suite caveat.
+    ///
+    /// When `OpenOptions.separate_read_connection` is true,
+    /// the client opens a second connection here (in the
+    /// WAL mode default) so subscriptions read on their own
+    /// handle. In that case `read_conn_owned` is true so
+    /// `close()` knows to release the second connection
+    /// separately from `conn`.
+    read_conn: *schema_mod.Connection,
+    read_conn_owned: bool = false,
+
     /// Writer mutex — SQLite is single-writer per file. We
     /// serialize all appends inside this process to avoid
     /// SQLITE_BUSY and to keep the transaction code simple.
@@ -34,6 +51,17 @@ pub const Client = struct {
     /// the connection.
     closed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
+    /// Live count of background worker threads (catch-up +
+    /// persistent subscription loops) currently inside the
+    /// client. `close()` waits on this counter reaching zero
+    /// before tearing the connection down so an in-flight
+    /// `readStream` cannot dereference a closed handle.
+    /// Incremented by the spawn helpers in `subscribe.zig` /
+    /// `persistent.zig` *after* re-checking `closed` (to close
+    /// the small window where a caller races with a concurrent
+    /// `close()`), and decremented via `defer` at worker exit.
+    active_workers: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+
     /// Open options captured for diagnostics and reused by
     /// subscription defaults.
     path: []const u8,
@@ -52,8 +80,23 @@ pub const Client = struct {
         const path_copy = try allocator.dupe(u8, opts.path);
         errdefer allocator.free(path_copy);
 
+        // Dedicated read connection for subscription workers.
+        // Opened with `SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE`
+        // so the migration pragmas inside `Connection.open`
+        // remain idempotent (WAL mode is per-connection but the
+        // file-level schema is shared and already-current; the
+        // second open just observes it). We never issue writes
+        // through this handle from the library.
+        const read_conn: *schema_mod.Connection = if (opts.separate_read_connection)
+            try schema_mod.Connection.open(allocator, opts.path, opts.busy_timeout_ms)
+        else
+            conn;
+        errdefer if (opts.separate_read_connection) read_conn.close();
+
         client.* = .{
             .conn = conn,
+            .read_conn = read_conn,
+            .read_conn_owned = opts.separate_read_connection,
             .allocator = allocator,
             .waker = Waker.init(allocator),
             .path = path_copy,
@@ -72,19 +115,35 @@ pub const Client = struct {
     /// will observe a closed channel.
     pub fn close(self: *Client) void {
         if (self.closed.swap(true, .seq_cst)) return;
-        // Give the subscription workers a brief window to observe
-        // the closed flag and exit before we tear down the waker
-        // and the SQLite connection. The workers check `closed`
-        // at the top of every loop iteration; without this grace
-        // period, an in-flight `readStream` would dereference a
-        // closed connection and segfault.
+
+        // Order matters here. Step 1 flags each registered
+        // `Waiter` so the worker busy-loops inside
+        // `Waker.wait()` exit on their next slice, instead of
+        // sitting out their full poll timeout. Step 2 then
+        // waits for that exit to actually happen (workers do
+        // `defer { _ = active_workers.fetchSub(1, ...) }`, so
+        // reaching zero proves no read is in flight against
+        // the SQLite handle).
+        self.waker.deinit();
+
+        // Hard cap so a wedged worker (blocked in
+        // `Waker.wait`, in a paging-induced sleep, or in any
+        // unrelated kernel call) cannot make `close()` hang
+        // the process. Past the cap the worker may segfault
+        // when it dereferences the destroyed `self.conn`; that
+        // is no worse than the pre-fix behaviour and signals a
+        // real bug to the operator rather than masking it.
+        const deadline_ns: u64 = 200 * std.time.ns_per_ms;
         var threaded = std.Io.Threaded.init_single_threaded;
         const io = threaded.io();
         const start = std.Io.Clock.now(.boot, io).nanoseconds;
-        while (std.Io.Clock.now(.boot, io).nanoseconds - start < 20 * std.time.ns_per_ms) {
+        while (self.active_workers.load(.seq_cst) != 0) {
+            const elapsed = std.Io.Clock.now(.boot, io).nanoseconds - start;
+            if (elapsed > deadline_ns) break;
             std.atomic.spinLoopHint();
         }
-        self.waker.deinit();
+
+        if (self.read_conn_owned) self.read_conn.close();
         self.conn.close();
         self.allocator.free(self.path);
         self.allocator.destroy(self);

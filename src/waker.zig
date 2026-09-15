@@ -28,12 +28,31 @@ pub const Waker = struct {
     }
 
     pub fn deinit(self: *Waker) void {
+        // Mark every registered waiter as closed (so the
+        // worker busy-loops inside `wait()` exit promptly) and
+        // detach the list so no new `register()` calls succeed.
+        //
+        // IMPORTANT: we do NOT destroy the waiter structs here.
+        // Each worker holds a `Waiter*` and frees it via
+        // `unregister()` in its own defer. If `deinit()` also
+        // destroyed the struct, the workers would walk a
+        // use-after-free pointer when their defers fired after
+        // the client tore itself down. The shutdown contract is:
+        //
+        //   1. `Client.close()` -> `Waker.deinit()` -> flags set
+        //   2. workers exit, decrement `Client.active_workers`
+        //   3. `close()` waits `active_workers == 0`
+        //   4. workers' `unregister()` defers destroy the waiters
+        //   5. `close()` destroys the connection and the client
+        //
+        // That ordering is only safe because `deinit()` no
+        // longer frees anything; if it did, step 4 would race
+        // step 1.
         self.lock();
         var cur = self.head;
         while (cur) |w| {
             const next = w.next;
             w.closed.store(true, .release);
-            self.allocator.destroy(w);
             cur = next;
         }
         self.head = null;

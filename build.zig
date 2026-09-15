@@ -31,6 +31,7 @@ const test_files = [_]TestFile{
     .{ .name = "unit-errors", .path = "tests/unit/errors.zig" },
     .{ .name = "load-volume", .path = "tests/load/volume.zig" },
     .{ .name = "stress-concurrent", .path = "tests/stress/concurrent.zig" },
+    .{ .name = "stress-separate-read-conn", .path = "tests/stress/separate_read_conn.zig" },
     .{ .name = "chaos-close", .path = "tests/chaos/close.zig" },
     .{ .name = "chaos-files", .path = "tests/chaos/files.zig" },
     .{ .name = "security-injection", .path = "tests/security/injection.zig" },

@@ -112,6 +112,16 @@ pub fn subscribeToStream(
     if (self.closed.load(.seq_cst)) return error.DatabaseClosed;
     if (stream_id.len == 0) return error.InvalidArgument;
 
+    // Register the worker with the client *before* spawning, so
+    // a concurrent `close()` waits for this new worker before
+    // tearing down the connection. The race "closed flips
+    // between our load and our increment" is closed by
+    // re-checking `closed` after the increment and rolling back
+    // if we lose to a concurrent close.
+    _ = self.active_workers.fetchAdd(1, .seq_cst);
+    errdefer _ = self.active_workers.fetchSub(1, .seq_cst);
+    if (self.closed.load(.seq_cst)) return error.DatabaseClosed;
+
     const from_rev: i64 = switch (opts.from) {
         .start, .start_backward => 0,
         .end => blk: {
@@ -169,6 +179,11 @@ pub fn subscribeToAll(
     allocator: std.mem.Allocator,
     opts: types.SubscribeOptions,
 ) (errors_mod.Error || std.mem.Allocator.Error || std.Thread.SpawnError)!Subscription {
+    if (self.closed.load(.seq_cst)) return error.DatabaseClosed;
+    // Same race-closing pattern as `subscribeToStream` —
+    // see the comment block there for the reasoning.
+    _ = self.active_workers.fetchAdd(1, .seq_cst);
+    errdefer _ = self.active_workers.fetchSub(1, .seq_cst);
     if (self.closed.load(.seq_cst)) return error.DatabaseClosed;
 
     const from_pos_commit: u64 = switch (opts.from) {
@@ -259,19 +274,41 @@ pub const Subscription = struct {
 };
 
 fn runStream(ctx: *RunContext) void {
-    defer ctx.allocator.destroy(ctx);
-    defer ctx.allocator.free(ctx.stream_id);
+    // Defer ordering matters here: Zig defers are LIFO, so
+    // the LAST-declared defer runs FIRST. We want at exit:
+    //
+    //   1. decrement `active_workers`     <-- declared LAST
+    //   2. unregister the Waiter          <-- declared 3rd
+    //   3. free `ctx.stream_id`           <-- declared 2nd
+    //   4. destroy `ctx`                  <-- declared 1st
+    //
+    // The previous version declared them in the opposite
+    // order and segfaulted: `destroy(ctx)` ran first, after
+    // which `ctx.client.active_workers.fetchSub` and
+    // `ctx.allocator.free(ctx.stream_id)` both read through
+    // the freed ctx pointer.
     var cursor: i64 = ctx.from_rev;
     const waiter = ctx.client.waker.register() catch return;
+    defer ctx.allocator.destroy(ctx);
+    defer ctx.allocator.free(ctx.stream_id);
     defer ctx.client.waker.unregister(waiter);
+    defer _ = ctx.client.active_workers.fetchSub(1, .seq_cst);
 
     // Bail out promptly if the client was already closed before the
     // worker even spun up. Otherwise we touch `self.client.conn` on a
     // destroyed connection and segfault.
+    //
+    // Subscription reads are routed through `Client.read_conn`
+    // (set in `Client.open`). When the caller enabled
+    // `OpenOptions.separate_read_connection`, `read_conn` is
+    // its own SQLite file handle and writers on `conn` no
+    // longer block this worker — addressing the v0.1 stress
+    // test's 500–800-of-1 000 delivery race.
     while (!ctx.done.load(.seq_cst) and !ctx.client.closed.load(.seq_cst)) {
-        const res = readStream(
+        const res = readStreamOnConn(
             ctx.client,
             ctx.allocator,
+            ctx.client.read_conn,
             ctx.stream_id,
             .{ .from = .{ .revision = @intCast(@max(0, cursor)) }, .direction = .forward, .limit = ctx.client.max_batch_size },
         ) catch |err| {
@@ -301,19 +338,21 @@ fn runStream(ctx: *RunContext) void {
         _ = Waker.wait(waiter, ctx.poll_interval_ms);
     }
 }
-const _u: u8 = 0;
 
 fn runAll(ctx: *RunContext) void {
-    defer ctx.allocator.destroy(ctx);
-    defer ctx.allocator.free(ctx.stream_id);
+    // See `runStream` for the LIFO defer-order rationale.
     var cursor: u64 = ctx.from_pos_commit;
     const waiter = ctx.client.waker.register() catch return;
+    defer ctx.allocator.destroy(ctx);
+    defer ctx.allocator.free(ctx.stream_id);
     defer ctx.client.waker.unregister(waiter);
+    defer _ = ctx.client.active_workers.fetchSub(1, .seq_cst);
 
     while (!ctx.done.load(.seq_cst) and !ctx.client.closed.load(.seq_cst)) {
-        const res = readAll(
+        const res = readAllOnConn(
             ctx.client,
             ctx.allocator,
+            ctx.client.read_conn,
             .{ .from = .{ .position = .{ .commit = cursor, .prepare = cursor } }, .direction = .forward, .limit = ctx.client.max_batch_size },
         ) catch |err| {
             ctx.queue.put(.{ .err = err });
@@ -339,5 +378,5 @@ fn runAll(ctx: *RunContext) void {
     }
 }
 
-const readStream = @import("read.zig").readStream;
-const readAll = @import("read.zig").readAll;
+const readStreamOnConn = @import("read.zig").readStreamOnConn;
+const readAllOnConn = @import("read.zig").readAllOnConn;

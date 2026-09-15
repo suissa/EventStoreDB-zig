@@ -218,6 +218,22 @@ pub const OpenOptions = struct {
 
     /// Max concurrent connections. Default 4.
     max_connections: u32 = 4,
+
+    /// If `true`, the client opens a second SQLite
+    /// connection dedicated to subscription workers
+    /// (catch-up + persistent) so they do not contend with
+    /// `appendToStream` on the writer connection. Costs
+    /// one extra SQLite file handle per Client; on the
+    /// v0.1 single-writer model, writers do not contend
+    /// with this connection either, so under sustained
+    /// append load, subscriptions stop losing events to
+    /// the documented 500–800-of-1 000 race condition
+    /// (see `tests/stress/concurrent.zig`).
+    ///
+    /// Default `false` to preserve v0.1 behaviour; turn
+    /// on for production deployments that mix append and
+    /// subscription load.
+    separate_read_connection: bool = false,
 };
 
 /// Item sent through a catch-up subscription's queue. The

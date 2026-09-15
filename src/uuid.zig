@@ -4,6 +4,28 @@
 //! do not have to thread an `Io` through everywhere. This is
 //! called from the append hot path; if the cost shows up in a
 //! profile, move to a per-Client Io.
+//!
+//! ## Security posture (v0.1) — read before changing the call site
+//!
+//! `Threaded.init_single_threaded` is a *non-entropy-bearing*
+//! `Io`: `randomSecure` there always fails with `error.NoSecureEntropy`,
+//! and the code below falls back to `io.random`. That means
+//! **every auto-generated `event_id` produced by this library
+//! today is a non-cryptographic PRNG output**, not a CSPRNG one.
+//!
+//! This is acceptable for the only role `event_id` currently
+//! plays — a server-internal idempotency key, where the only
+//! attacker is a concurrent client trying to collide on its
+//! own UUID, which `random` (xoshiro-style) makes vanishingly
+//! unlikely at 122 bits of entropy.
+//!
+//! It is **not** acceptable the moment `event_id` (or any
+//! output of `newV4`) starts being relied on for authenticity,
+//! non-repudiation, or externally-visible uniqueness. If that
+//! day comes, switch `newV4` to take a caller-supplied `Io`
+//! that is constructed against a real entropy source (e.g.
+//! an `Io.Threaded` instance with `randomSecure` wired to the
+//! OS CSPRNG).
 
 const std = @import("std");
 const Uuid = @import("types.zig").Uuid;
@@ -35,11 +57,10 @@ pub fn format(allocator: std.mem.Allocator, id: Uuid) ![]u8 {
         &buf,
         "{x:0>2}{x:0>2}{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}",
         .{
-            id[0], id[1], id[2],  id[3],
-            id[4], id[5],
-            id[6], id[7],
-            id[8], id[9],
-            id[10], id[11], id[12], id[13], id[14], id[15],
+            id[0],  id[1],  id[2],  id[3],
+            id[4],  id[5],  id[6],  id[7],
+            id[8],  id[9],  id[10], id[11],
+            id[12], id[13], id[14], id[15],
         },
     ) catch unreachable;
     return allocator.dupe(u8, &buf);

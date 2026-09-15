@@ -1,0 +1,45 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Match the toolchain the project itself documents (see
+# AGENTS.md). Using a version action other than the one
+# already pinned by the project's build would mask real
+# regressions.
+env:
+  ZIG_VERSION: 0.16.0
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig ${{ env.ZIG_VERSION }}
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      # `-j1` is deliberate: the Zig 0.16 test runner prints
+      # a cosmetic `failed command: ... test.exe --listen=-`
+      # line on Windows even when every test passes, because
+      # of the IPC handshake with the runner parent. The
+      # serial run reported in `zig build test --summary all`
+      # is what the repository treats as the source of truth;
+      # see `docs/Parecer-eventstoredb-zig.html` for the
+      # note that motivated `-j1`.
+      - name: Build & test
+        run: zig build test --summary all -j1
+
+      - name: Format check
+        # Catch unreformatted `.zig` files. We use `zig fmt`
+        # in `--check` mode so CI only flags the regression
+        # rather than rewriting the commit.
+        run: zig fmt --check src/ tests/

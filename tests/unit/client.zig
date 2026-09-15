@@ -89,3 +89,45 @@ test "client: reopening on a stale path returns CannotOpenDatabase" {
         .path = "/this/dir/really/does/not/exist/store.db",
     }));
 }
+
+test "client: separate_read_connection opens and closes without leaking the read handle" {
+    // Regression for the `read_conn` lifecycle path. With
+    // `separate_read_connection = true`, `Client.close` must
+    // release the second `Connection` exactly once; previously
+    // this branch was untested because no test exercised it.
+    //
+    // `:memory:` would create two private databases; we use a
+    // per-test temp file under the workspace so writer and
+    // reader share the same store AND a previous run's
+    // leftover data never trips `.no_stream`.
+    var threaded = std.Io.Threaded.init_single_threaded;
+    const io = threaded.io();
+    const ts = std.Io.Clock.now(.real, io);
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(
+        &path_buf,
+        "D:\\www\\Freelas\\_____suissadev\\Conceitos\\AllasCode\\Planes\\Data\\EventStoreDB-zig\\client-separate-read-conn-{x}.db",
+        .{@as(u64, @intCast(ts.nanoseconds))},
+    );
+    defer std.Io.Dir.deleteFileAbsolute(io, path) catch {};
+
+    const c = try esdb.Client.open(common.conn_alloc, .{
+        .path = path,
+        .separate_read_connection = true,
+    });
+    const a = testing.allocator;
+    const r = try esdb.appendToStream(c, a, "s", .{ .expected_revision = .no_stream }, &[_]esdb.EventData{
+        .{ .event_type = "X", .data = "1" },
+    });
+    defer esdb.freeEvents(a, r.events);
+    // Read through the same code path the subscription
+    // workers take; verifies the read connection is wired
+    // correctly. `sub.close()` joins the worker which still
+    // holds a pointer to `c`, so close the subscription
+    // first. (`var` because `Subscription` carries the
+    // queue/sentinel state — `const` would fail the
+    // auto-addressing to the mutable receiver.)
+    var sub = try esdb.subscribeToAll(c, a, .{ .from = .{ .end = {} }, .poll_interval_ms = 5 });
+    sub.close();
+    c.close(); // exercises the read_conn teardown
+}

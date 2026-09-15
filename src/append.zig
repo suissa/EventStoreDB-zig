@@ -27,7 +27,6 @@ pub fn appendToStream(
     events: []const types.EventData,
 ) (errors_mod.Error || std.mem.Allocator.Error)!types.AppendResult {
     if (self.closed.load(.seq_cst)) return error.DatabaseClosed;
-    if (self.closed.load(.seq_cst)) return error.DatabaseClosed;
     if (stream_id.len == 0) return error.InvalidArgument;
     if (events.len == 0) return error.InvalidArgument;
 

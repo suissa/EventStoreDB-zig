@@ -9,9 +9,25 @@ const bind = @import("bind.zig");
 const Client = @import("client.zig").Client;
 
 /// Read a page of events from a single stream.
+///
+/// Public callers go through `Client.readStream`, which routes
+/// the read through the writer connection. Subscription
+/// workers (`runStream`, `runPS`) use `readStreamOnConn` and
+/// pass `Client.read_conn` instead, isolating read traffic
+/// from append traffic under heavy write load.
 pub fn readStream(
     self: *Client,
     allocator: std.mem.Allocator,
+    stream_id: []const u8,
+    opts: types.ReadOptions,
+) (errors_mod.Error || std.mem.Allocator.Error)!types.ReadResult {
+    return readStreamOnConn(self, allocator, self.conn, stream_id, opts);
+}
+
+pub fn readStreamOnConn(
+    self: *Client,
+    allocator: std.mem.Allocator,
+    conn: *schema_mod.Connection,
     stream_id: []const u8,
     opts: types.ReadOptions,
 ) (errors_mod.Error || std.mem.Allocator.Error)!types.ReadResult {
@@ -19,9 +35,9 @@ pub fn readStream(
     if (stream_id.len == 0) return error.InvalidArgument;
 
     const limit: u32 = if (opts.limit == 0) self.max_batch_size else opts.limit;
-    if (try isTombstoned(self.conn, stream_id)) return error.StreamTombstoned;
+    if (try isTombstoned(conn, stream_id)) return error.StreamTombstoned;
 
-    const from_rev = try resolveFromRevision(self, stream_id, switch (opts.from) {
+    const from_rev = try resolveFromRevision(conn, stream_id, switch (opts.from) {
         .start => if (opts.direction == .backward) .start_backward else .start,
         else => opts.from,
     });
@@ -42,8 +58,8 @@ pub fn readStream(
         \\LIMIT ?
     ;
 
-    const stmt = try bind.prepare(self.conn.db, self.conn.allocator, sql);
-    defer bind.finalize(self.conn.allocator, stmt);
+    const stmt = try bind.prepare(conn.db, conn.allocator, sql);
+    defer bind.finalize(conn.allocator, stmt);
     _ = bind.bindText(stmt, 1, stream_id);
     _ = bind.bindI64(stmt, 2, from_rev);
     _ = bind.bindI64(stmt, 3, @intCast(@as(i64, @intCast(limit))));
@@ -52,9 +68,23 @@ pub fn readStream(
 }
 
 /// Read a page of events from the global all-stream log.
+///
+/// Public callers go through `Client.readAll`, which routes
+/// through the writer connection. Subscription workers
+/// (`runAll`) use `readAllOnConn` and pass `Client.read_conn`
+/// to keep their reads off the writer's critical path.
 pub fn readAll(
     self: *Client,
     allocator: std.mem.Allocator,
+    opts: types.ReadOptions,
+) (errors_mod.Error || std.mem.Allocator.Error)!types.ReadResult {
+    return readAllOnConn(self, allocator, self.conn, opts);
+}
+
+pub fn readAllOnConn(
+    self: *Client,
+    allocator: std.mem.Allocator,
+    conn: *schema_mod.Connection,
     opts: types.ReadOptions,
 ) (errors_mod.Error || std.mem.Allocator.Error)!types.ReadResult {
     if (self.closed.load(.seq_cst)) return error.DatabaseClosed;
@@ -88,8 +118,8 @@ pub fn readAll(
     ;
     const sql: []const u8 = if (use_strict) sql_strict else sql_loose;
 
-    const stmt = try bind.prepare(self.conn.db, self.conn.allocator, sql);
-    defer bind.finalize(self.conn.allocator, stmt);
+    const stmt = try bind.prepare(conn.db, conn.allocator, sql);
+    defer bind.finalize(conn.allocator, stmt);
     _ = bind.bindI64(stmt, 1, min_pos);
     _ = bind.bindI64(stmt, 2, @intCast(@as(i64, @intCast(limit))));
 
@@ -190,7 +220,7 @@ fn isTombstoned(conn: *schema_mod.Connection, stream_id: []const u8) !bool {
     return c.sqlite3_column_type(stmt, 0) != c.SQLITE_NULL;
 }
 
-fn resolveFromRevision(self: *Client, stream_id: []const u8, from: types.From) !i64 {
+fn resolveFromRevision(conn: *schema_mod.Connection, stream_id: []const u8, from: types.From) !i64 {
     _ = stream_id;
     switch (from) {
         .start => return 0,
@@ -200,7 +230,7 @@ fn resolveFromRevision(self: *Client, stream_id: []const u8, from: types.From) !
         .start_backward => return std.math.maxInt(i64),
         .end => {
             const v = @import("client.zig").scalarI64(
-                self.conn,
+                conn,
                 "SELECT revision FROM streams WHERE stream_id = ?",
             ) catch |err| switch (err) {
                 // Stream does not exist: there are no events

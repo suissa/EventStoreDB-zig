@@ -19,11 +19,22 @@ bin/
 *.db-shm
 *.db-wal
 
-# Test output
-*.test
-*.out
-test.log
-build.log
+# Work artefacts produced during `zig build test` that lack
+# an extension or use a non-`*.db*` name; historically slipped
+# past the *.db* rules above and ended up tracked.
+*.tmp
+ok
+ok-*
+demo.db
+demo.db-*
+/ok
+/ok-*
+
+# One-off review artefacts left in `docs/` (saved pages +
+# downloaded assets). Keep them locally if you need them,
+# but do not commit.
+docs/Parecer-*.html
+docs/Parecer-*/
 
 # Editor / OS
 .idea/

@@ -17,7 +17,7 @@ const errors_mod = @import("errors.zig");
 const schema_mod = @import("schema.zig");
 const bind = @import("bind.zig");
 const Client = @import("client.zig").Client;
-const readStream = @import("read.zig").readStream;
+const readStream = @import("read.zig").readStreamOnConn;
 
 const Queue = struct {
     mu: std.atomic.Mutex = .unlocked,
@@ -160,6 +160,15 @@ pub fn connectPersistentSubscription(
     if (self.closed.load(.seq_cst)) return error.DatabaseClosed;
     if (stream_id.len == 0 or group_name.len == 0) return error.InvalidArgument;
 
+    // See the matching comment in `subscribe.zig` for the race
+    // window we are closing: increment first, re-check `closed`
+    // so a concurrent `Client.close()` waits on the worker we
+    // are about to spawn instead of tearing the handle down
+    // under its feet.
+    _ = self.active_workers.fetchAdd(1, .seq_cst);
+    errdefer _ = self.active_workers.fetchSub(1, .seq_cst);
+    if (self.closed.load(.seq_cst)) return error.DatabaseClosed;
+
     const stmt = try bind.prepare(
         self.conn.db,
         self.conn.allocator,
@@ -186,7 +195,7 @@ pub fn connectPersistentSubscription(
         .done = done,
         .last_position = @intCast(last_pos),
     };
-    const thread = try std.Thread.spawn(.{}, runPS, .{ &sub });
+    const thread = try std.Thread.spawn(.{}, runPS, .{&sub});
     sub.thread = thread;
     return sub;
 }
@@ -269,11 +278,21 @@ pub const PersistentSubscription = struct {
 };
 
 fn runPS(sub: *PersistentSubscription) void {
+    // Counter bookkeeping for `Client.close()`
+    // determinism — see the matching comment in
+    // `subscribe.zig::runStream`.
+    defer _ = sub.client.active_workers.fetchSub(1, .seq_cst);
     var cursor: u64 = sub.last_position;
+    // Persistent subscription reads also go through
+    // `Client.read_conn` so that the persistent worker does
+    // not contend with `appendToStream` on the writer
+    // connection. See `subscribe.zig::runStream` for the
+    // matching rationale.
     while (!sub.done.load(.seq_cst)) {
         const res = readStream(
             sub.client,
             sub.allocator,
+            sub.client.read_conn,
             sub.stream_id,
             .{ .from = .{ .revision = cursor }, .direction = .forward, .limit = sub.client.max_batch_size },
         ) catch |err| {
@@ -329,8 +348,7 @@ fn sleepMs(ms: u32) void {
 /// third-party caller that wants the real JSON can wrap this.
 fn stringifyConfig(allocator: std.mem.Allocator, cfg: types.PersistentConfig) ![]u8 {
     var buf: [256]u8 = undefined;
-    const slice = try std.fmt.bufPrint(
-        &buf,
+    const slice = try std.fmt.bufPrint(&buf,
         \\{{"resolve_link_tos":{},"extra_statistics":{},"max_retry_count":{d},"check_point_after":{d},"min_check_point_count":{d},"max_check_point_count":{d},"live_buffer_size":{d},"read_batch_size":{d}}}
     , .{
         cfg.resolve_link_tos,

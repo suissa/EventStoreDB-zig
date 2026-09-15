@@ -146,6 +146,26 @@ subscriptions:
 This gives sub-poll-interval latency on a busy stream and
 falls back to polling on an idle one.
 
+#### Read connection layout
+
+Subscription workers (`runStream`, `runAll`, `runPS`) read
+through `Client.read_conn` rather than the writer
+connection. Two options are exposed via `OpenOptions`:
+
+- **Default (`separate_read_connection = false`):** the
+  client uses a single SQLite connection shared by writers
+  and subscription workers. This matches the v0.1 model and
+  preserves identical semantics for existing consumers.
+- **Opt-in (`separate_read_connection = true`):** the
+  client opens a second `Connection` in WAL mode and routes
+  subscription reads through it. Writers and readers no
+  longer compete for the same file handle. Under sustained
+  append load this raises the catch-up delivery rate from
+  the historic 500–800 of 1 000 (documented in the pre-fix
+  `tests/stress/concurrent.zig`) to all 1 000 within the
+  same 2 s budget — see `tests/stress/separate_read_conn.zig`
+  for the regression test.
+
 ### Persistent subscription delivery
 
 `ConnectPersistentSubscription` adds:
