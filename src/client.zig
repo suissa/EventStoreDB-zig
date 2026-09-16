@@ -55,11 +55,7 @@ pub const Client = struct {
     /// persistent subscription loops) currently inside the
     /// client. `close()` waits on this counter reaching zero
     /// before tearing the connection down so an in-flight
-    /// `readStream` cannot dereference a closed handle.
-    /// Incremented by the spawn helpers in `subscribe.zig` /
-    /// `persistent.zig` *after* re-checking `closed` (to close
-    /// the small window where a caller races with a concurrent
-    /// `close()`), and decremented via `defer` at worker exit.
+    /// read cannot dereference a closed handle.
     active_workers: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
     /// Open options captured for diagnostics and reused by
@@ -80,13 +76,6 @@ pub const Client = struct {
         const path_copy = try allocator.dupe(u8, opts.path);
         errdefer allocator.free(path_copy);
 
-        // Dedicated read connection for subscription workers.
-        // Opened with `SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE`
-        // so the migration pragmas inside `Connection.open`
-        // remain idempotent (WAL mode is per-connection but the
-        // file-level schema is shared and already-current; the
-        // second open just observes it). We never issue writes
-        // through this handle from the library.
         const read_conn: *schema_mod.Connection = if (opts.separate_read_connection)
             try schema_mod.Connection.open(allocator, opts.path, opts.busy_timeout_ms)
         else
@@ -104,42 +93,26 @@ pub const Client = struct {
             .max_batch_size = opts.max_batch_size,
         };
 
-        // Warm the last_log_pos cache.
         client.last_log_pos.store(@intCast(try conn.queryScalarI64("SELECT COALESCE(MAX(log_position), 0) FROM events")), .seq_cst);
 
         return client;
     }
 
     /// Release the connection. After this, all other methods
-    /// return `error.DatabaseClosed`. In-flight subscriptions
-    /// will observe a closed channel.
+    /// return `error.DatabaseClosed`.
+    ///
+    /// Shutdown is deterministic: once `closed` is published we
+    /// wake every catch-up waiter and do not destroy SQLite or the
+    /// Client allocation until every registered background worker
+    /// has exited. A bounded timeout here would turn a slow worker
+    /// into a use-after-free, so worker lifetime is part of the
+    /// Client ownership contract rather than a best-effort wait.
     pub fn close(self: *Client) void {
         if (self.closed.swap(true, .seq_cst)) return;
 
-        // Order matters here. Step 1 flags each registered
-        // `Waiter` so the worker busy-loops inside
-        // `Waker.wait()` exit on their next slice, instead of
-        // sitting out their full poll timeout. Step 2 then
-        // waits for that exit to actually happen (workers do
-        // `defer { _ = active_workers.fetchSub(1, ...) }`, so
-        // reaching zero proves no read is in flight against
-        // the SQLite handle).
         self.waker.deinit();
 
-        // Hard cap so a wedged worker (blocked in
-        // `Waker.wait`, in a paging-induced sleep, or in any
-        // unrelated kernel call) cannot make `close()` hang
-        // the process. Past the cap the worker may segfault
-        // when it dereferences the destroyed `self.conn`; that
-        // is no worse than the pre-fix behaviour and signals a
-        // real bug to the operator rather than masking it.
-        const deadline_ns: u64 = 200 * std.time.ns_per_ms;
-        var threaded = std.Io.Threaded.init_single_threaded;
-        const io = threaded.io();
-        const start = std.Io.Clock.now(.boot, io).nanoseconds;
         while (self.active_workers.load(.seq_cst) != 0) {
-            const elapsed = std.Io.Clock.now(.boot, io).nanoseconds - start;
-            if (elapsed > deadline_ns) break;
             std.atomic.spinLoopHint();
         }
 
