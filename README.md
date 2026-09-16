@@ -1,4 +1,6 @@
-# eventstoredb-zig
+<p align="center"><img width="1672" height="941" alt="1000449274" src="https://github.com/user-attachments/assets/1ab1c97d-7d33-47d5-a50a-31775e3161e0" />
+</p>
+
 
 > **EventStoreDB-compatible event store over SQLite — embedded, single-binary, zero-ops, written in Zig.**
 
