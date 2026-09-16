@@ -36,6 +36,14 @@ demo.db-*
 docs/Parecer-*.html
 docs/Parecer-*/
 
+# Local development logs. Anything matching `tests-run*.log`
+# is a per-run capture from `zig build test` invocations —
+# noise, not source. `*-output.log` likewise.
+tests-run*.log
+*-output.log
+.zig-cache-stale*/
+
+
 # Editor / OS
 .idea/
 .vscode/
