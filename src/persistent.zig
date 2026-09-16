@@ -1,14 +1,7 @@
 //! Persistent subscriptions. Each consumer group is a row in
 //! `persistent_subscriptions` plus an in-flight table
 //! `persistent_acks` that records every delivered-but-not-acked
-//! event. The engine advances the group's checkpoint when the
-//! caller invokes `ack`; on restart it resumes from the last
-//! checkpoint and re-delivers any parked / unacked messages.
-//!
-//! This module mirrors the queue/wake pattern from `subscribe.zig`
-//! because Zig 0.16 removed `std.Thread.Channel` and
-//! `std.Thread.Condition`. See the comment at the top of that
-//! file for the rationale.
+//! event.
 
 const std = @import("std");
 const c = @import("c.zig").c;
@@ -19,18 +12,28 @@ const bind = @import("bind.zig");
 const Client = @import("client.zig").Client;
 const readStream = @import("read.zig").readStreamOnConn;
 
+const PersistentMessageOrErr = union(enum) {
+    message: types.PersistentMessage,
+    err: errors_mod.Error,
+    closed: void,
+};
+
 const Queue = struct {
     mu: std.atomic.Mutex = .unlocked,
     head: usize = 0,
     tail: usize = 0,
     buf: [4096]PersistentMessageOrErr = undefined,
     closed: bool = false,
+    allocator: std.mem.Allocator,
 
     fn put(self: *Queue, item: PersistentMessageOrErr) void {
         while (!self.mu.tryLock()) std.atomic.spinLoopHint();
         defer self.mu.unlock();
         const next_tail = (self.tail + 1) % self.buf.len;
-        if (next_tail == self.head) return; // drop on full
+        if (next_tail == self.head) {
+            freeItem(self.allocator, item);
+            return;
+        }
         self.buf[self.tail] = item;
         self.tail = next_tail;
     }
@@ -52,13 +55,21 @@ const Queue = struct {
         defer self.mu.unlock();
         self.closed = true;
     }
+
+    fn drain(self: *Queue) void {
+        while (!self.mu.tryLock()) std.atomic.spinLoopHint();
+        defer self.mu.unlock();
+        while (self.head != self.tail) {
+            const item = self.buf[self.head];
+            self.head = (self.head + 1) % self.buf.len;
+            freeItem(self.allocator, item);
+        }
+    }
 };
 
-const PersistentMessageOrErr = union(enum) {
-    message: types.PersistentMessage,
-    err: errors_mod.Error,
-    closed: void,
-};
+fn freeItem(allocator: std.mem.Allocator, item: PersistentMessageOrErr) void {
+    if (item == .message) types.freeEvent(allocator, item.message.event);
+}
 
 pub fn createPersistentSubscription(
     self: *Client,
@@ -151,6 +162,16 @@ pub fn deletePersistentSubscription(
     _ = c.sqlite3_step(s2);
 }
 
+const PSRunContext = struct {
+    client: *Client,
+    allocator: std.mem.Allocator,
+    stream_id: []const u8,
+    group_name: []const u8,
+    queue: *Queue,
+    done: *std.atomic.Value(bool),
+    last_position: u64,
+};
+
 pub fn connectPersistentSubscription(
     self: *Client,
     allocator: std.mem.Allocator,
@@ -160,11 +181,6 @@ pub fn connectPersistentSubscription(
     if (self.closed.load(.seq_cst)) return error.DatabaseClosed;
     if (stream_id.len == 0 or group_name.len == 0) return error.InvalidArgument;
 
-    // See the matching comment in `subscribe.zig` for the race
-    // window we are closing: increment first, re-check `closed`
-    // so a concurrent `Client.close()` waits on the worker we
-    // are about to spawn instead of tearing the handle down
-    // under its feet.
     _ = self.active_workers.fetchAdd(1, .seq_cst);
     errdefer _ = self.active_workers.fetchSub(1, .seq_cst);
     if (self.closed.load(.seq_cst)) return error.DatabaseClosed;
@@ -182,22 +198,47 @@ pub fn connectPersistentSubscription(
     const last_pos = c.sqlite3_column_int64(stmt, 0);
 
     const queue = try allocator.create(Queue);
-    queue.* = .{};
+    errdefer allocator.destroy(queue);
+    queue.* = .{ .allocator = allocator };
+
     const done = try allocator.create(std.atomic.Value(bool));
+    errdefer allocator.destroy(done);
     done.* = std.atomic.Value(bool).init(false);
 
-    const sub = PersistentSubscription{
+    const sub_stream_id = try allocator.dupe(u8, stream_id);
+    errdefer allocator.free(sub_stream_id);
+    const sub_group_name = try allocator.dupe(u8, group_name);
+    errdefer allocator.free(sub_group_name);
+
+    const ctx = try allocator.create(PSRunContext);
+    errdefer allocator.destroy(ctx);
+    const ctx_stream_id = try allocator.dupe(u8, stream_id);
+    errdefer allocator.free(ctx_stream_id);
+    const ctx_group_name = try allocator.dupe(u8, group_name);
+    errdefer allocator.free(ctx_group_name);
+
+    ctx.* = .{
         .client = self,
         .allocator = allocator,
-        .stream_id = try allocator.dupe(u8, stream_id),
-        .group_name = try allocator.dupe(u8, group_name),
+        .stream_id = ctx_stream_id,
+        .group_name = ctx_group_name,
         .queue = queue,
         .done = done,
         .last_position = @intCast(last_pos),
     };
-    const thread = try std.Thread.spawn(.{}, runPS, .{&sub});
-    sub.thread = thread;
-    return sub;
+
+    const thread = try std.Thread.spawn(.{}, runPS, .{ctx});
+
+    return .{
+        .client = self,
+        .allocator = allocator,
+        .stream_id = sub_stream_id,
+        .group_name = sub_group_name,
+        .queue = queue,
+        .done = done,
+        .thread = thread,
+        .last_position = @intCast(last_pos),
+    };
 }
 
 pub const PersistentSubscription = struct {
@@ -233,6 +274,7 @@ pub const PersistentSubscription = struct {
 
     pub fn ack(self: *PersistentSubscription, ev_id: types.Uuid) errors_mod.Error!void {
         if (self.closed) return error.SubscriptionClosed;
+        if (self.client.closed.load(.seq_cst)) return error.DatabaseClosed;
         self.client.writer_mu.lock();
         defer self.client.writer_mu.unlock();
         const stmt = bind.prepare(
@@ -244,11 +286,12 @@ pub const PersistentSubscription = struct {
         _ = bind.bindText(stmt, 1, self.group_name);
         _ = bind.bindText(stmt, 2, self.stream_id);
         _ = bind.bindBlob(stmt, 3, &ev_id);
-        _ = c.sqlite3_step(stmt);
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.Sqlite;
     }
 
     pub fn nack(self: *PersistentSubscription, ev_id: types.Uuid, park: bool) errors_mod.Error!void {
         if (self.closed) return error.SubscriptionClosed;
+        if (self.client.closed.load(.seq_cst)) return error.DatabaseClosed;
         self.client.writer_mu.lock();
         defer self.client.writer_mu.unlock();
         const stmt = bind.prepare(
@@ -261,7 +304,7 @@ pub const PersistentSubscription = struct {
         _ = bind.bindText(stmt, 2, self.group_name);
         _ = bind.bindText(stmt, 3, self.stream_id);
         _ = bind.bindBlob(stmt, 4, &ev_id);
-        _ = c.sqlite3_step(stmt);
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.Sqlite;
     }
 
     pub fn close(self: *PersistentSubscription) void {
@@ -270,6 +313,7 @@ pub const PersistentSubscription = struct {
         self.queue.close();
         self.done.store(true, .seq_cst);
         if (self.thread) |t| t.join();
+        self.queue.drain();
         self.allocator.free(self.stream_id);
         self.allocator.free(self.group_name);
         self.allocator.destroy(self.queue);
@@ -277,59 +321,72 @@ pub const PersistentSubscription = struct {
     }
 };
 
-fn runPS(sub: *PersistentSubscription) void {
-    // Counter bookkeeping for `Client.close()`
-    // determinism — see the matching comment in
-    // `subscribe.zig::runStream`.
-    defer _ = sub.client.active_workers.fetchSub(1, .seq_cst);
-    var cursor: u64 = sub.last_position;
-    // Persistent subscription reads also go through
-    // `Client.read_conn` so that the persistent worker does
-    // not contend with `appendToStream` on the writer
-    // connection. See `subscribe.zig::runStream` for the
-    // matching rationale.
-    while (!sub.done.load(.seq_cst)) {
+fn runPS(ctx: *PSRunContext) void {
+    defer ctx.allocator.destroy(ctx);
+    defer ctx.allocator.free(ctx.group_name);
+    defer ctx.allocator.free(ctx.stream_id);
+    defer _ = ctx.client.active_workers.fetchSub(1, .seq_cst);
+
+    var cursor: u64 = ctx.last_position;
+    while (!ctx.done.load(.seq_cst) and !ctx.client.closed.load(.seq_cst)) {
         const res = readStream(
-            sub.client,
-            sub.allocator,
-            sub.client.read_conn,
-            sub.stream_id,
-            .{ .from = .{ .revision = cursor }, .direction = .forward, .limit = sub.client.max_batch_size },
+            ctx.client,
+            ctx.allocator,
+            ctx.client.read_conn,
+            ctx.stream_id,
+            .{ .from = .{ .revision = cursor }, .direction = .forward, .limit = ctx.client.max_batch_size },
         ) catch |err| {
-            sub.queue.put(.{ .err = err });
-            sleepMs(sub.client.poll_interval_ms);
+            if (ctx.client.closed.load(.seq_cst)) break;
+            ctx.queue.put(.{ .err = err });
+            sleepMs(ctx.client.poll_interval_ms);
             continue;
         };
 
-        if (res.events.len == 0) {
-            sleepMs(sub.client.poll_interval_ms);
+        const outer = res.events;
+        if (outer.len == 0) {
+            ctx.allocator.free(outer);
+            sleepMs(ctx.client.poll_interval_ms);
             continue;
         }
 
-        for (res.events) |ev| {
-            sub.client.writer_mu.lock();
-            defer sub.client.writer_mu.unlock();
-            const stmt = bind.prepare(
-                sub.client.conn.db,
-                sub.client.conn.allocator,
-                "INSERT OR REPLACE INTO persistent_acks(group_name, stream_id, event_id, log_position, retry_count, parked, enqueued_at) VALUES (?, ?, ?, ?, 0, 0, ?)",
-            ) catch continue;
-            defer bind.finalize(sub.client.conn.allocator, stmt);
-            _ = bind.bindText(stmt, 1, sub.group_name);
-            _ = bind.bindText(stmt, 2, sub.stream_id);
-            _ = bind.bindBlob(stmt, 3, &ev.event_id);
-            _ = bind.bindI64(stmt, 4, @intCast(@as(i64, @intCast(ev.log_position))));
-            _ = bind.bindI64(stmt, 5, schema_mod.nowMs());
-            _ = c.sqlite3_step(stmt);
+        for (outer) |ev| {
+            if (ctx.done.load(.seq_cst) or ctx.client.closed.load(.seq_cst)) {
+                types.freeEvent(ctx.allocator, ev);
+                continue;
+            }
 
-            sub.queue.put(.{ .message = .{ .event = ev, .retry_count = 0 } });
+            ctx.client.writer_mu.lock();
+            const stmt = bind.prepare(
+                ctx.client.conn.db,
+                ctx.client.conn.allocator,
+                "INSERT OR REPLACE INTO persistent_acks(group_name, stream_id, event_id, log_position, retry_count, parked, enqueued_at) VALUES (?, ?, ?, ?, 0, 0, ?)",
+            ) catch {
+                ctx.client.writer_mu.unlock();
+                types.freeEvent(ctx.allocator, ev);
+                continue;
+            };
+            _ = bind.bindText(stmt, 1, ctx.group_name);
+            _ = bind.bindText(stmt, 2, ctx.stream_id);
+            _ = bind.bindBlob(stmt, 3, &ev.event_id);
+            _ = bind.bindI64(stmt, 4, @intCast(ev.log_position));
+            _ = bind.bindI64(stmt, 5, schema_mod.nowMs());
+            const rc = c.sqlite3_step(stmt);
+            bind.finalize(ctx.client.conn.allocator, stmt);
+            ctx.client.writer_mu.unlock();
+
+            if (rc != c.SQLITE_DONE) {
+                types.freeEvent(ctx.allocator, ev);
+                ctx.queue.put(.{ .err = error.Sqlite });
+                continue;
+            }
+
+            ctx.queue.put(.{ .message = .{ .event = ev, .retry_count = 0 } });
             cursor = ev.revision + 1;
         }
-
-        if (res.events.len == 0) {
-            sleepMs(sub.client.poll_interval_ms);
-        }
+        ctx.allocator.free(outer);
     }
+
+    ctx.queue.close();
 }
 
 fn sleepMs(ms: u32) void {
@@ -341,11 +398,6 @@ fn sleepMs(ms: u32) void {
     }
 }
 
-/// Hand-rolled `PersistentConfig` -> JSON encoder. The stdlib
-/// `std.json` API is unstable in Zig 0.16; this struct has six
-/// fields and we want a stable blob so the persistent group row
-/// can be decoded back to a `PersistentConfig` later. A
-/// third-party caller that wants the real JSON can wrap this.
 fn stringifyConfig(allocator: std.mem.Allocator, cfg: types.PersistentConfig) ![]u8 {
     var buf: [256]u8 = undefined;
     const slice = try std.fmt.bufPrint(&buf,
