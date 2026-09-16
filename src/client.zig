@@ -4,7 +4,6 @@
 //! waker that wakes catch-up subscribers after an append.
 
 const std = @import("std");
-const c = @import("c.zig").c;
 const types = @import("types.zig");
 const errors_mod = @import("errors.zig");
 const schema_mod = @import("schema.zig");
@@ -18,55 +17,36 @@ pub const Client = struct {
     /// Connection used by subscription workers (catch-up
     /// `runStream`/`runAll` and persistent `runPS`).
     ///
-    /// By default this is the same pointer as `conn` (the
-    /// writer connection); subscriptions and writers then
-    /// share one SQLite handle and contend under sustained
-    /// append load — see the v0.1 stress-suite caveat.
-    ///
-    /// When `OpenOptions.separate_read_connection` is true,
-    /// the client opens a second connection here (in the
-    /// WAL mode default) so subscriptions read on their own
-    /// handle. In that case `read_conn_owned` is true so
-    /// `close()` knows to release the second connection
-    /// separately from `conn`.
+    /// By default this is the same pointer as `conn`. When
+    /// `OpenOptions.separate_read_connection` is true, file-backed
+    /// stores use a second connection so WAL readers do not share the
+    /// writer handle. Plain `:memory:` is rejected with this option,
+    /// because two SQLite `:memory:` handles are two different stores.
     read_conn: *schema_mod.Connection,
     read_conn_owned: bool = false,
 
-    /// Writer mutex — SQLite is single-writer per file. We
-    /// serialize all appends inside this process to avoid
-    /// SQLITE_BUSY and to keep the transaction code simple.
+    /// SQLite is single-writer per file. Serialize writes inside the
+    /// process so expected-revision checks and their append commit are
+    /// observed as one writer-critical section.
     writer_mu: spinlock.Spinlock = .{},
 
-    /// In-memory cache of the highest log position allocated.
-    /// Maintained by `appendToStream` and loaded once at open.
     last_log_pos: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-
-    /// Broadcast to every catch-up subscriber when an append
-    /// commits. Lets them wake instantly rather than waiting
-    /// for their next poll tick.
     waker: Waker,
-
-    /// Set to true by `close`. Other methods check this and
-    /// return `error.DatabaseClosed` instead of dereferencing
-    /// the connection.
     closed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-
-    /// Live count of background worker threads (catch-up +
-    /// persistent subscription loops) currently inside the
-    /// client. `close()` waits on this counter reaching zero
-    /// before tearing the connection down so an in-flight
-    /// read cannot dereference a closed handle.
     active_workers: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
-    /// Open options captured for diagnostics and reused by
-    /// subscription defaults.
     path: []const u8,
     poll_interval_ms: u32,
     max_batch_size: u32,
 
-    /// Open a new client. The path can be ":memory:" for an
-    /// in-memory store, or any SQLite-acceptable file path.
     pub fn open(allocator: std.mem.Allocator, opts: types.OpenOptions) errors_mod.Error!*Client {
+        // A normal SQLite `:memory:` database belongs to one connection.
+        // Opening a second handle would create an independent database and
+        // make subscription workers appear to lose every appended event.
+        if (opts.separate_read_connection and std.mem.eql(u8, opts.path, ":memory:")) {
+            return error.UnsupportedConfiguration;
+        }
+
         const conn = try schema_mod.Connection.open(allocator, opts.path, opts.busy_timeout_ms);
         errdefer conn.close();
 
@@ -94,26 +74,19 @@ pub const Client = struct {
         };
 
         client.last_log_pos.store(@intCast(try conn.queryScalarI64("SELECT COALESCE(MAX(log_position), 0) FROM events")), .seq_cst);
-
         return client;
     }
 
-    /// Release the connection. After this, all other methods
-    /// return `error.DatabaseClosed`.
-    ///
-    /// Shutdown is deterministic: once `closed` is published we
-    /// wake every catch-up waiter and do not destroy SQLite or the
-    /// Client allocation until every registered background worker
-    /// has exited. A bounded timeout here would turn a slow worker
-    /// into a use-after-free, so worker lifetime is part of the
-    /// Client ownership contract rather than a best-effort wait.
+    /// Shutdown is deterministic: publish closed, wake waiters and wait
+    /// for all registered workers before releasing either SQLite handle.
     pub fn close(self: *Client) void {
         if (self.closed.swap(true, .seq_cst)) return;
-
         self.waker.deinit();
 
+        var threaded: std.Io.Threaded = .init_single_threaded;
+        const io = threaded.io();
         while (self.active_workers.load(.seq_cst) != 0) {
-            std.atomic.spinLoopHint();
+            io.sleep(.fromMilliseconds(1), .awake) catch {};
         }
 
         if (self.read_conn_owned) self.read_conn.close();
@@ -122,14 +95,10 @@ pub const Client = struct {
         self.allocator.destroy(self);
     }
 
-    /// Return the most recent log position. Used by
-    /// `appendToStream` to validate the in-memory cache.
     pub fn lastLogPosition(self: *Client) u64 {
         return self.last_log_pos.load(.seq_cst);
     }
 
-    /// Aggregate statistics. Useful for the CLI's `stats`
-    /// command and for tests.
     pub fn stats(self: *Client) errors_mod.Error!types.Stats {
         if (self.closed.load(.seq_cst)) return error.DatabaseClosed;
 
