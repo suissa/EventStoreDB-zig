@@ -82,10 +82,17 @@ test "client: file store supports separate read connection" {
     var threaded: std.Io.Threaded = .init_single_threaded;
     const io = threaded.io();
     const ts = std.Io.Clock.now(.real, io);
+
     var path_buf: [128]u8 = undefined;
+    var wal_buf: [140]u8 = undefined;
+    var shm_buf: [140]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, "client-separate-read-{x}.db", .{@as(u64, @intCast(ts.nanoseconds))});
+    const wal_path = try std.fmt.bufPrint(&wal_buf, "{s}-wal", .{path});
+    const shm_path = try std.fmt.bufPrint(&shm_buf, "{s}-shm", .{path});
+
+    defer std.Io.Dir.cwd().deleteFile(io, shm_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, wal_path) catch {};
     defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
-    defer std.Io.Dir.cwd().deleteFile(io, try std.fmt.bufPrint(&path_buf, "{s}-wal", .{path})) catch {};
 
     const c = try esdb.Client.open(common.conn_alloc, .{
         .path = path,
