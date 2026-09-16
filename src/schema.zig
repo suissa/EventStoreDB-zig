@@ -142,8 +142,6 @@ const schemaSQL =
     \\  enqueued_at INTEGER NOT NULL,
     \\  PRIMARY KEY (group_name, stream_id, event_id)
     \\);
-    \\CREATE INDEX IF NOT EXISTS idx_persistent_acks_frontier
-    \\  ON persistent_acks(group_name, stream_id, event_number, acked, parked);
     \\
     \\CREATE TABLE IF NOT EXISTS snapshots (
     \\  stream_id TEXT NOT NULL,
@@ -186,8 +184,6 @@ fn applyMigrations(conn: *Connection) errors.Error!void {
                 try conn.exec("CREATE INDEX IF NOT EXISTS idx_events_tags ON events(tags);");
             },
             3 => {
-                // Persistent-subscription checkpoint correctness needs the
-                // stream revision and durable ACK state, not only log position.
                 try addColumnIfMissing(conn, "persistent_acks", "event_number", "INTEGER");
                 try addColumnIfMissing(conn, "persistent_acks", "acked", "INTEGER NOT NULL DEFAULT 0");
                 try conn.exec(
