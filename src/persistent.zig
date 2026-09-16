@@ -1,7 +1,6 @@
-//! Persistent subscriptions. Each consumer group is a row in
-//! `persistent_subscriptions` plus an in-flight table
-//! `persistent_acks` that records every delivered-but-not-acked
-//! event.
+//! Persistent subscriptions with durable in-flight state and a
+//! contiguous ACK checkpoint. ACKs may arrive out of order but the
+//! durable checkpoint never advances across an incomplete revision.
 
 const std = @import("std");
 const c = @import("c.zig").c;
@@ -26,16 +25,29 @@ const Queue = struct {
     closed: bool = false,
     allocator: std.mem.Allocator,
 
-    fn put(self: *Queue, item: PersistentMessageOrErr) void {
-        while (!self.mu.tryLock()) std.atomic.spinLoopHint();
-        defer self.mu.unlock();
-        const next_tail = (self.tail + 1) % self.buf.len;
-        if (next_tail == self.head) {
-            freeItem(self.allocator, item);
-            return;
+    fn put(
+        self: *Queue,
+        item: PersistentMessageOrErr,
+        done: *std.atomic.Value(bool),
+        client_closed: *std.atomic.Value(bool),
+    ) bool {
+        while (true) {
+            while (!self.mu.tryLock()) std.atomic.spinLoopHint();
+            if (self.closed or done.load(.seq_cst) or client_closed.load(.seq_cst)) {
+                self.mu.unlock();
+                freeItem(self.allocator, item);
+                return false;
+            }
+            const next_tail = (self.tail + 1) % self.buf.len;
+            if (next_tail != self.head) {
+                self.buf[self.tail] = item;
+                self.tail = next_tail;
+                self.mu.unlock();
+                return true;
+            }
+            self.mu.unlock();
+            sleepMs(1);
         }
-        self.buf[self.tail] = item;
-        self.tail = next_tail;
     }
 
     fn get(self: *Queue) ?PersistentMessageOrErr {
@@ -71,6 +83,13 @@ fn freeItem(allocator: std.mem.Allocator, item: PersistentMessageOrErr) void {
     if (item == .message) types.freeEvent(allocator, item.message.event);
 }
 
+fn sleepMs(ms: u32) void {
+    if (ms == 0) return;
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    const io = threaded.io();
+    io.sleep(.fromMilliseconds(ms), .awake) catch {};
+}
+
 pub fn createPersistentSubscription(
     self: *Client,
     allocator: std.mem.Allocator,
@@ -87,22 +106,23 @@ pub fn createPersistentSubscription(
     defer self.writer_mu.unlock();
 
     if (!overwrite) {
-        const stmt = bind.prepare(
-            self.conn.db,
-            self.conn.allocator,
-            "SELECT 1 FROM persistent_subscriptions WHERE group_name = ? AND stream_id = ?",
-        ) catch return error.Sqlite;
-        defer bind.finalize(self.conn.allocator, stmt);
-        _ = bind.bindText(stmt, 1, group_name);
-        _ = bind.bindText(stmt, 2, stream_id);
-        if (c.sqlite3_step(stmt) == c.SQLITE_ROW) return error.PersistentSubscriptionExists;
+        const exists = bind.prepare(self.conn.db, self.conn.allocator, "SELECT 1 FROM persistent_subscriptions WHERE group_name = ? AND stream_id = ?") catch return error.Sqlite;
+        defer bind.finalize(self.conn.allocator, exists);
+        _ = bind.bindText(exists, 1, group_name);
+        _ = bind.bindText(exists, 2, stream_id);
+        if (c.sqlite3_step(exists) == c.SQLITE_ROW) return error.PersistentSubscriptionExists;
     }
 
     const from_rev: i64 = switch (opts.from) {
         .start, .start_backward => 0,
-        .end => 0,
+        .end => blk: {
+            const stmt = bind.prepare(self.conn.db, self.conn.allocator, "SELECT COALESCE(revision + 1, 0) FROM streams WHERE stream_id = ?") catch return error.Sqlite;
+            defer bind.finalize(self.conn.allocator, stmt);
+            _ = bind.bindText(stmt, 1, stream_id);
+            break :blk if (c.sqlite3_step(stmt) == c.SQLITE_ROW) c.sqlite3_column_int64(stmt, 0) else 0;
+        },
         .revision => |r| @intCast(r),
-        .position => 0,
+        .position => return error.InvalidArgument,
     };
 
     const cfg_buf = stringifyConfig(allocator, cfg) catch return error.Sqlite;
@@ -130,36 +150,31 @@ pub fn createPersistentSubscription(
     if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.Sqlite;
 }
 
-pub fn deletePersistentSubscription(
-    self: *Client,
-    group_name: []const u8,
-    stream_id: []const u8,
-) errors_mod.Error!void {
+pub fn deletePersistentSubscription(self: *Client, group_name: []const u8, stream_id: []const u8) errors_mod.Error!void {
     if (self.closed.load(.seq_cst)) return error.DatabaseClosed;
     if (group_name.len == 0 or stream_id.len == 0) return error.InvalidArgument;
 
     self.writer_mu.lock();
     defer self.writer_mu.unlock();
 
-    const s1 = bind.prepare(
-        self.conn.db,
-        self.conn.allocator,
-        "DELETE FROM persistent_acks WHERE group_name = ? AND stream_id = ?",
-    ) catch return error.Sqlite;
+    try self.conn.exec("BEGIN IMMEDIATE");
+    var tx_open = true;
+    defer if (tx_open) self.conn.exec("ROLLBACK") catch {};
+
+    const s1 = try bind.prepare(self.conn.db, self.conn.allocator, "DELETE FROM persistent_acks WHERE group_name = ? AND stream_id = ?");
     defer bind.finalize(self.conn.allocator, s1);
     _ = bind.bindText(s1, 1, group_name);
     _ = bind.bindText(s1, 2, stream_id);
-    _ = c.sqlite3_step(s1);
+    if (c.sqlite3_step(s1) != c.SQLITE_DONE) return error.Sqlite;
 
-    const s2 = bind.prepare(
-        self.conn.db,
-        self.conn.allocator,
-        "DELETE FROM persistent_subscriptions WHERE group_name = ? AND stream_id = ?",
-    ) catch return error.Sqlite;
+    const s2 = try bind.prepare(self.conn.db, self.conn.allocator, "DELETE FROM persistent_subscriptions WHERE group_name = ? AND stream_id = ?");
     defer bind.finalize(self.conn.allocator, s2);
     _ = bind.bindText(s2, 1, group_name);
     _ = bind.bindText(s2, 2, stream_id);
-    _ = c.sqlite3_step(s2);
+    if (c.sqlite3_step(s2) != c.SQLITE_DONE) return error.Sqlite;
+
+    try self.conn.exec("COMMIT");
+    tx_open = false;
 }
 
 const PSRunContext = struct {
@@ -185,22 +200,16 @@ pub fn connectPersistentSubscription(
     errdefer _ = self.active_workers.fetchSub(1, .seq_cst);
     if (self.closed.load(.seq_cst)) return error.DatabaseClosed;
 
-    const stmt = try bind.prepare(
-        self.conn.db,
-        self.conn.allocator,
-        "SELECT last_position, config FROM persistent_subscriptions WHERE group_name = ? AND stream_id = ?",
-    );
+    const stmt = try bind.prepare(self.conn.db, self.conn.allocator, "SELECT last_position FROM persistent_subscriptions WHERE group_name = ? AND stream_id = ?");
     defer bind.finalize(self.conn.allocator, stmt);
     _ = bind.bindText(stmt, 1, group_name);
     _ = bind.bindText(stmt, 2, stream_id);
     if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.PersistentSubscriptionNotFound;
-
     const last_pos = c.sqlite3_column_int64(stmt, 0);
 
     const queue = try allocator.create(Queue);
     errdefer allocator.destroy(queue);
     queue.* = .{ .allocator = allocator };
-
     const done = try allocator.create(std.atomic.Value(bool));
     errdefer allocator.destroy(done);
     done.* = std.atomic.Value(bool).init(false);
@@ -228,7 +237,6 @@ pub fn connectPersistentSubscription(
     };
 
     const thread = try std.Thread.spawn(.{}, runPS, .{ctx});
-
     return .{
         .client = self,
         .allocator = allocator,
@@ -263,7 +271,7 @@ pub const PersistentSubscription = struct {
                 return item;
             }
             if (self.done.load(.seq_cst)) return null;
-            std.atomic.spinLoopHint();
+            sleepMs(1);
         }
     }
 
@@ -272,21 +280,72 @@ pub const PersistentSubscription = struct {
         return self.queue.get();
     }
 
+    /// Mark one delivered event complete and advance the durable checkpoint
+    /// only through the highest contiguous completed revision.
     pub fn ack(self: *PersistentSubscription, ev_id: types.Uuid) errors_mod.Error!void {
         if (self.closed) return error.SubscriptionClosed;
         if (self.client.closed.load(.seq_cst)) return error.DatabaseClosed;
+
         self.client.writer_mu.lock();
         defer self.client.writer_mu.unlock();
-        const stmt = bind.prepare(
-            self.client.conn.db,
-            self.client.conn.allocator,
-            "DELETE FROM persistent_acks WHERE group_name = ? AND stream_id = ? AND event_id = ?",
-        ) catch return error.Sqlite;
-        defer bind.finalize(self.client.conn.allocator, stmt);
-        _ = bind.bindText(stmt, 1, self.group_name);
-        _ = bind.bindText(stmt, 2, self.stream_id);
-        _ = bind.bindBlob(stmt, 3, &ev_id);
-        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.Sqlite;
+        const conn = self.client.conn;
+
+        try conn.exec("BEGIN IMMEDIATE");
+        var tx_open = true;
+        defer if (tx_open) conn.exec("ROLLBACK") catch {};
+
+        const event_number = try findInflightEventNumber(conn, self.group_name, self.stream_id, ev_id);
+
+        const mark = try bind.prepare(conn.db, conn.allocator, "UPDATE persistent_acks SET acked = 1 WHERE group_name = ? AND stream_id = ? AND event_id = ?");
+        defer bind.finalize(conn.allocator, mark);
+        _ = bind.bindText(mark, 1, self.group_name);
+        _ = bind.bindText(mark, 2, self.stream_id);
+        _ = bind.bindBlob(mark, 3, &ev_id);
+        if (c.sqlite3_step(mark) != c.SQLITE_DONE) return error.Sqlite;
+        _ = event_number;
+
+        const checkpoint = try readGroupCheckpoint(conn, self.group_name, self.stream_id);
+        const first_incomplete = try queryFrontierScalar(
+            conn,
+            "SELECT MIN(event_number) FROM persistent_acks WHERE group_name = ? AND stream_id = ? AND event_number >= ? AND acked = 0",
+            self.group_name,
+            self.stream_id,
+            checkpoint,
+        );
+
+        var frontier: i64 = checkpoint;
+        if (first_incomplete) |gap| {
+            frontier = gap;
+        } else if (try queryFrontierScalar(
+            conn,
+            "SELECT MAX(event_number) FROM persistent_acks WHERE group_name = ? AND stream_id = ? AND event_number >= ?",
+            self.group_name,
+            self.stream_id,
+            checkpoint,
+        )) |max_tracked| {
+            frontier = max_tracked + 1;
+        }
+
+        const update = try bind.prepare(conn.db, conn.allocator, "UPDATE persistent_subscriptions SET last_position = ?, updated_at = ? WHERE group_name = ? AND stream_id = ?");
+        defer bind.finalize(conn.allocator, update);
+        _ = bind.bindI64(update, 1, frontier);
+        _ = bind.bindI64(update, 2, schema_mod.nowMs());
+        _ = bind.bindText(update, 3, self.group_name);
+        _ = bind.bindText(update, 4, self.stream_id);
+        if (c.sqlite3_step(update) != c.SQLITE_DONE) return error.Sqlite;
+
+        // Completed rows below the durable frontier can no longer affect
+        // replay or out-of-order ACK calculation and are safe to compact.
+        const cleanup = try bind.prepare(conn.db, conn.allocator, "DELETE FROM persistent_acks WHERE group_name = ? AND stream_id = ? AND acked = 1 AND event_number < ?");
+        defer bind.finalize(conn.allocator, cleanup);
+        _ = bind.bindText(cleanup, 1, self.group_name);
+        _ = bind.bindText(cleanup, 2, self.stream_id);
+        _ = bind.bindI64(cleanup, 3, frontier);
+        if (c.sqlite3_step(cleanup) != c.SQLITE_DONE) return error.Sqlite;
+
+        try conn.exec("COMMIT");
+        tx_open = false;
+        self.last_position = @intCast(frontier);
     }
 
     pub fn nack(self: *PersistentSubscription, ev_id: types.Uuid, park: bool) errors_mod.Error!void {
@@ -294,11 +353,8 @@ pub const PersistentSubscription = struct {
         if (self.client.closed.load(.seq_cst)) return error.DatabaseClosed;
         self.client.writer_mu.lock();
         defer self.client.writer_mu.unlock();
-        const stmt = bind.prepare(
-            self.client.conn.db,
-            self.client.conn.allocator,
-            "UPDATE persistent_acks SET retry_count = retry_count + 1, parked = ? WHERE group_name = ? AND stream_id = ? AND event_id = ?",
-        ) catch return error.Sqlite;
+
+        const stmt = try bind.prepare(self.client.conn.db, self.client.conn.allocator, "UPDATE persistent_acks SET retry_count = retry_count + 1, parked = ?, acked = 0 WHERE group_name = ? AND stream_id = ? AND event_id = ?");
         defer bind.finalize(self.client.conn.allocator, stmt);
         _ = bind.bindI64(stmt, 1, if (park) 1 else 0);
         _ = bind.bindText(stmt, 2, self.group_name);
@@ -321,6 +377,65 @@ pub const PersistentSubscription = struct {
     }
 };
 
+const InflightState = struct {
+    acked: bool,
+    parked: bool,
+    retry_count: u32,
+};
+
+fn findInflightEventNumber(conn: *schema_mod.Connection, group_name: []const u8, stream_id: []const u8, ev_id: types.Uuid) errors_mod.Error!i64 {
+    const stmt = try bind.prepare(conn.db, conn.allocator, "SELECT event_number FROM persistent_acks WHERE group_name = ? AND stream_id = ? AND event_id = ?");
+    defer bind.finalize(conn.allocator, stmt);
+    _ = bind.bindText(stmt, 1, group_name);
+    _ = bind.bindText(stmt, 2, stream_id);
+    _ = bind.bindBlob(stmt, 3, &ev_id);
+    if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.NotFound;
+    if (c.sqlite3_column_type(stmt, 0) == c.SQLITE_NULL) return error.Sqlite;
+    return c.sqlite3_column_int64(stmt, 0);
+}
+
+fn readGroupCheckpoint(conn: *schema_mod.Connection, group_name: []const u8, stream_id: []const u8) errors_mod.Error!i64 {
+    const stmt = try bind.prepare(conn.db, conn.allocator, "SELECT last_position FROM persistent_subscriptions WHERE group_name = ? AND stream_id = ?");
+    defer bind.finalize(conn.allocator, stmt);
+    _ = bind.bindText(stmt, 1, group_name);
+    _ = bind.bindText(stmt, 2, stream_id);
+    if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.PersistentSubscriptionNotFound;
+    return c.sqlite3_column_int64(stmt, 0);
+}
+
+fn queryFrontierScalar(
+    conn: *schema_mod.Connection,
+    sql: []const u8,
+    group_name: []const u8,
+    stream_id: []const u8,
+    checkpoint: i64,
+) errors_mod.Error!?i64 {
+    const stmt = try bind.prepare(conn.db, conn.allocator, sql);
+    defer bind.finalize(conn.allocator, stmt);
+    _ = bind.bindText(stmt, 1, group_name);
+    _ = bind.bindText(stmt, 2, stream_id);
+    _ = bind.bindI64(stmt, 3, checkpoint);
+    if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.Sqlite;
+    if (c.sqlite3_column_type(stmt, 0) == c.SQLITE_NULL) return null;
+    return c.sqlite3_column_int64(stmt, 0);
+}
+
+fn readInflightState(conn: *schema_mod.Connection, group_name: []const u8, stream_id: []const u8, ev_id: types.Uuid) errors_mod.Error!?InflightState {
+    const stmt = try bind.prepare(conn.db, conn.allocator, "SELECT acked, parked, retry_count FROM persistent_acks WHERE group_name = ? AND stream_id = ? AND event_id = ?");
+    defer bind.finalize(conn.allocator, stmt);
+    _ = bind.bindText(stmt, 1, group_name);
+    _ = bind.bindText(stmt, 2, stream_id);
+    _ = bind.bindBlob(stmt, 3, &ev_id);
+    const rc = c.sqlite3_step(stmt);
+    if (rc == c.SQLITE_DONE) return null;
+    if (rc != c.SQLITE_ROW) return error.Sqlite;
+    return .{
+        .acked = c.sqlite3_column_int64(stmt, 0) != 0,
+        .parked = c.sqlite3_column_int64(stmt, 1) != 0,
+        .retry_count = @intCast(c.sqlite3_column_int64(stmt, 2)),
+    };
+}
+
 fn runPS(ctx: *PSRunContext) void {
     defer ctx.allocator.destroy(ctx);
     defer ctx.allocator.free(ctx.group_name);
@@ -337,7 +452,7 @@ fn runPS(ctx: *PSRunContext) void {
             .{ .from = .{ .revision = cursor }, .direction = .forward, .limit = ctx.client.max_batch_size },
         ) catch |err| {
             if (ctx.client.closed.load(.seq_cst)) break;
-            ctx.queue.put(.{ .err = err });
+            _ = ctx.queue.put(.{ .err = err }, ctx.done, &ctx.client.closed);
             sleepMs(ctx.client.poll_interval_ms);
             continue;
         };
@@ -349,53 +464,75 @@ fn runPS(ctx: *PSRunContext) void {
             continue;
         }
 
+        var stopped = false;
         for (outer) |ev| {
-            if (ctx.done.load(.seq_cst) or ctx.client.closed.load(.seq_cst)) {
+            if (stopped or ctx.done.load(.seq_cst) or ctx.client.closed.load(.seq_cst)) {
                 types.freeEvent(ctx.allocator, ev);
                 continue;
             }
 
             ctx.client.writer_mu.lock();
+            const existing = readInflightState(ctx.client.conn, ctx.group_name, ctx.stream_id, ev.event_id) catch {
+                ctx.client.writer_mu.unlock();
+                types.freeEvent(ctx.allocator, ev);
+                _ = ctx.queue.put(.{ .err = error.Sqlite }, ctx.done, &ctx.client.closed);
+                continue;
+            };
+
+            if (existing) |state| {
+                ctx.client.writer_mu.unlock();
+                // An ACK recorded beyond an earlier gap must survive restart.
+                // Skip it during replay rather than resetting it to incomplete.
+                if (state.acked or state.parked) {
+                    cursor = ev.revision + 1;
+                    types.freeEvent(ctx.allocator, ev);
+                    continue;
+                }
+                if (!ctx.queue.put(.{ .message = .{ .event = ev, .retry_count = state.retry_count } }, ctx.done, &ctx.client.closed)) {
+                    stopped = true;
+                    continue;
+                }
+                cursor = ev.revision + 1;
+                continue;
+            }
+
             const stmt = bind.prepare(
                 ctx.client.conn.db,
                 ctx.client.conn.allocator,
-                "INSERT OR REPLACE INTO persistent_acks(group_name, stream_id, event_id, log_position, retry_count, parked, enqueued_at) VALUES (?, ?, ?, ?, 0, 0, ?)",
+                "INSERT INTO persistent_acks(group_name, stream_id, event_id, event_number, log_position, retry_count, parked, acked, enqueued_at) VALUES (?, ?, ?, ?, ?, 0, 0, 0, ?)",
             ) catch {
                 ctx.client.writer_mu.unlock();
                 types.freeEvent(ctx.allocator, ev);
+                _ = ctx.queue.put(.{ .err = error.Sqlite }, ctx.done, &ctx.client.closed);
                 continue;
             };
             _ = bind.bindText(stmt, 1, ctx.group_name);
             _ = bind.bindText(stmt, 2, ctx.stream_id);
             _ = bind.bindBlob(stmt, 3, &ev.event_id);
-            _ = bind.bindI64(stmt, 4, @intCast(ev.log_position));
-            _ = bind.bindI64(stmt, 5, schema_mod.nowMs());
+            _ = bind.bindI64(stmt, 4, @intCast(ev.revision));
+            _ = bind.bindI64(stmt, 5, @intCast(ev.log_position));
+            _ = bind.bindI64(stmt, 6, schema_mod.nowMs());
             const rc = c.sqlite3_step(stmt);
             bind.finalize(ctx.client.conn.allocator, stmt);
             ctx.client.writer_mu.unlock();
 
             if (rc != c.SQLITE_DONE) {
                 types.freeEvent(ctx.allocator, ev);
-                ctx.queue.put(.{ .err = error.Sqlite });
+                _ = ctx.queue.put(.{ .err = error.Sqlite }, ctx.done, &ctx.client.closed);
                 continue;
             }
 
-            ctx.queue.put(.{ .message = .{ .event = ev, .retry_count = 0 } });
+            if (!ctx.queue.put(.{ .message = .{ .event = ev, .retry_count = 0 } }, ctx.done, &ctx.client.closed)) {
+                stopped = true;
+                continue;
+            }
             cursor = ev.revision + 1;
         }
         ctx.allocator.free(outer);
+        if (stopped) break;
     }
 
     ctx.queue.close();
-}
-
-fn sleepMs(ms: u32) void {
-    const slice_ns: u64 = std.time.ns_per_ms;
-    const deadline_ns: u64 = @as(u64, ms) * slice_ns;
-    var elapsed: u64 = 0;
-    while (elapsed < deadline_ns) : (elapsed += slice_ns) {
-        std.atomic.spinLoopHint();
-    }
 }
 
 fn stringifyConfig(allocator: std.mem.Allocator, cfg: types.PersistentConfig) ![]u8 {
