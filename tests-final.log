@@ -1,0 +1,189 @@
+﻿zig.exe : test
+No linha:2 caractere:8
++ $out = & zig build test --summary all -j1 2>&1
++        ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (test:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
++- run test
+   +- compile test Debug native 1 errors
+error: failed to check cache: 'tests\stress\separate_read_conn.zig' file_hash FileNotFound
+error: 1 compilation errors
+failed command: "D:\\downloads\\zig-x86_64-windows-0.17.0-dev.261+3d1fb4fac\\zig.exe" test 
+".zig-cache\\o\\fd2c67f66c98cd9c5f598b9124ecdc9e\\sqlite3.lib" -ODebug -I 
+".zig-cache\\o\\db777bcf59a3f33f16a4dcbb99db7992" --dep eventstoredb "-Mroot=D:\\www\\Freelas\\_____suissadev\\Conceito
+s\\AllasCode\\Planes\\Data\\EventStoreDB-zig\\tests\\stress\\separate_read_conn.zig" 
+".zig-cache\\o\\fd2c67f66c98cd9c5f598b9124ecdc9e\\sqlite3.lib" -ODebug -I 
+".zig-cache\\o\\db777bcf59a3f33f16a4dcbb99db7992" 
+"-Meventstoredb=D:\\www\\Freelas\\_____suissadev\\Conceitos\\AllasCode\\Planes\\Data\\EventStoreDB-zig\\src\\root.zig" 
+-lc --cache-dir .zig-cache --global-cache-dir "C:\\Users\\Jean Carlo\\AppData\\Local\\zig" --name test --zig-lib-dir 
+"D:\\downloads\\zig-x86_64-windows-0.17.0-dev.261+3d1fb4fac\\lib\\" --listen=-
+
+test
++- run test w
+[bench] append-volume: 1000 ops in 518174900 ns (518174 ns/op)
+[bench] readAll-volume: 1000 ops in 10558100 ns (10558 ns/op)
+failed command: ".\\.zig-cache\\o\\4035f960a26d55606dc4af7f9de64aaf\\test.exe" "--cache-dir=.\\.zig-cache" 
+--seed=0x963093a5 --listen=-
+
+Build Summary: 38/41 steps succeeded (1 failed); 91/91 tests passed
+test transitive failure
++- run test 8 pass (8 total) 40ms MaxRSS:9M
+|  +- compile test Debug native cached 38ms MaxRSS:19M
+|     +- WriteFile sqlite3.h cached
+|     +- compile lib sqlite3 Debug native cached 23ms MaxRSS:19M
+|     +- compile lib sqlite3 Debug native (reused)
+|     +- WriteFile sqlite3.h (reused)
+|     +- compile lib sqlite3 Debug native (reused)
+|     +- compile lib sqlite3 Debug native (reused)
++- run test 14 pass (14 total) 73ms MaxRSS:9M
+|  +- compile test Debug native cached 39ms MaxRSS:19M
+|     +- WriteFile sqlite3.h (reused)
+|     +- compile lib sqlite3 Debug native (reused)
+|     +- compile lib sqlite3 Debug native (reused)
+|     +- WriteFile sqlite3.h (reused)
+|     +- compile lib sqlite3 Debug native (reused)
+|     +- compile lib sqlite3 Debug native (reused)
++- run test 9 pass (9 total) 51ms MaxRSS:9M
+|  +- compile test Debug native cached 37ms MaxRSS:19M
+|     +- WriteFile sqlite3.h (reused)
+|     +- compile lib sqlite3 Debug native (reused)
+|     +- compile lib sqlite3 Debug native (reused)
+|     +- WriteFile sqlite3.h (reused)
+|     +- compile lib sqlite3 Debug native (reused)
+|     +- compile lib sqlite3 Debug native (reused)
++- run test 8 pass (8 total) 69ms MaxRSS:10M
+|  +- compile test Debug native cached 36ms MaxRSS:19M
+|     +- WriteFile sqlite3.h (reused)
+|     +- compile lib sqlite3 Debug native (reused)
+|     +- compile lib sqlite3 Debug native (reused)
+|     +- WriteFile sqlite3.h (reused)
+|     +- compile lib sqlite3 Debug native (reused)
+|     +- compile lib sqlite3 Debug native (reused)
++- run test 3 pass (3 total) 22ms MaxRSS:8M
+|  +- compile test Debug native cached 39ms MaxRSS:19M
+|     +- WriteFile sqlite3.h (reused)
+|     +- compile lib sqlite3 Debug native (reused)
+|     +- compile lib sqlite3 Debug native (reused)
+|     +- WriteFile sqlite3.h (reused)
+|     +- compile lib sqlite3 Debug native (reused)
+|     +- compile lib sqlite3 Debug native (reused)
++- run test 6 pass (6 total) 31ms MaxRSS:8M
+|  +- compile test Debug native cached 36ms MaxRSS:19M
+|     +- WriteFile sqlite3.h (reused)
+|     +- compile lib sqlite3 Debug native (reused)
+|     +- compile lib sqlite3 Debug native (reused)
+|     +- WriteFile sqlite3.h (reused)
+|     +- compile lib sqlite3 Debug native (reused)
+|     +- compile lib sqlite3 Debug native (reused)
++- run test 6 pass (6 total) 227ms MaxRSS:9M
+|  +- compile test Debug native cached 38ms MaxRSS:19M
+|     +- WriteFile sqlite3.h (reused)
+|     +- compile lib sqlite3 Debug native (reused)
+|     +- compile lib sqlite3 Debug native (reused)
+|     +- WriteFile sqlite3.h (reused)
+|     +- compile lib sqlite3 Debug native (reused)
+|     +- compile lib sqlite3 Debug native (reused)
++- run test 4 pass (4 total) 23ms MaxRSS:8M
+|  +- compile test Debug native cached 36ms MaxRSS:19M
+|     +- WriteFile sqlite3.h (reused)
+|     +- compile lib sqlite3 Debug native (reused)
+|     +- compile lib sqlite3 Debug native (reused)
+|     +- WriteFile sqlite3.h (reused)
+|     +- compile lib sqlite3 Debug native (reused)
+|     +- compile lib sqlite3 Debug native (reused)
++- run test 6 pass (6 total) 37ms MaxRSS:9M
+|  +- compile test Debug native cached 37ms MaxRSS:19M
+|     +- WriteFile sqlite3.h (reused)
+|     +- compile lib sqlite3 Debug native (reused)
+|     +- compile lib sqlite3 Debug native (reused)
+|     +- WriteFile sqlite3.h (reused)
+|     +- compile lib sqlite3 Debug native (reused)
+|     +- compile lib sqlite3 Debug native (reused)
++- run test 5 pass (5 total) 30ms MaxRSS:8M
+|  +- compile test Debug native cached 40ms MaxRSS:19M
+|     +- WriteFile sqlite3.h (reused)
+|     +- compile lib sqlite3 Debug native (reused)
+|     +- compile lib sqlite3 Debug native (reused)
+|     +- WriteFile sqlite3.h (reused)
+|     +- compile lib sqlite3 Debug native (reused)
+|     +- compile lib sqlite3 Debug native (reused)
++- run test 3 pass (3 total) 13ms MaxRSS:8M
+|  +- compile test Debug native cached 36ms MaxRSS:19M
+|     +- WriteFile sqlite3.h (reused)
+|     +- compile lib sqlite3 Debug native (reused)
+|     +- compile lib sqlite3 Debug native (reused)
+|     +- WriteFile sqlite3.h (reused)
+|     +- compile lib sqlite3 Debug native (reused)
+|     +- compile lib sqlite3 Debug native (reused)
++- run test 1 pass (1 total) 559ms MaxRSS:37M
+|  +- compile test Debug native cached 35ms MaxRSS:19M
+|     +- WriteFile sqlite3.h (reused)
+|     +- compile lib sqlite3 Debug native (reused)
+|     +- compile lib sqlite3 Debug native (reused)
+|     +- WriteFile sqlite3.h (reused)
+|     +- compile lib sqlite3 Debug native (reused)
+|     +- compile lib sqlite3 Debug native (reused)
++- run test transitive failure
+|  +- compile test Debug native 1 errors
+|     +- WriteFile sqlite3.h (reused)
+|     +- compile lib sqlite3 Debug native (reused)
+|     +- compile lib sqlite3 Debug native (reused)
+|     +- WriteFile sqlite3.h (reused)
+|     +- compile lib sqlite3 Debug native (reused)
+|     +- compile lib sqlite3 Debug native (reused)
++- run test 3 pass (3 total) 1s MaxRSS:11M
+|  +- compile test Debug native cached 39ms MaxRSS:19M
+|     +- WriteFile sqlite3.h (reused)
+|     +- compile lib sqlite3 Debug native (reused)
+|     +- compile lib sqlite3 Debug native (reused)
+|     +- WriteFile sqlite3.h (reused)
+|     +- compile lib sqlite3 Debug native (reused)
+|     +- compile lib sqlite3 Debug native (reused)
++- run test 3 pass (3 total) 13ms MaxRSS:8M
+|  +- compile test Debug native cached 37ms MaxRSS:19M
+|     +- WriteFile sqlite3.h (reused)
+|     +- compile lib sqlite3 Debug native (reused)
+|     +- compile lib sqlite3 Debug native (reused)
+|     +- WriteFile sqlite3.h (reused)
+|     +- compile lib sqlite3 Debug native (reused)
+|     +- compile lib sqlite3 Debug native (reused)
++- run test 2 pass (2 total) 29ms MaxRSS:9M
+|  +- compile test Debug native cached 37ms MaxRSS:19M
+|     +- WriteFile sqlite3.h (reused)
+|     +- compile lib sqlite3 Debug native (reused)
+|     +- compile lib sqlite3 Debug native (reused)
+|     +- WriteFile sqlite3.h (reused)
+|     +- compile lib sqlite3 Debug native (reused)
+|     +- compile lib sqlite3 Debug native (reused)
++- run test 5 pass (5 total) 40ms MaxRSS:14M
+|  +- compile test Debug native cached 38ms MaxRSS:19M
+|     +- WriteFile sqlite3.h (reused)
+|     +- compile lib sqlite3 Debug native (reused)
+|     +- compile lib sqlite3 Debug native (reused)
+|     +- WriteFile sqlite3.h (reused)
+|     +- compile lib sqlite3 Debug native (reused)
+|     +- compile lib sqlite3 Debug native (reused)
++- run test 2 pass (2 total) 7ms MaxRSS:5M
+|  +- compile test Debug native cached 37ms MaxRSS:19M
+|     +- WriteFile sqlite3.h (reused)
+|     +- compile lib sqlite3 Debug native (reused)
+|     +- compile lib sqlite3 Debug native (reused)
+|     +- WriteFile sqlite3.h (reused)
+|     +- compile lib sqlite3 Debug native (reused)
+|     +- compile lib sqlite3 Debug native (reused)
++- run test 3 pass (3 total) 24ms MaxRSS:8M
+   +- compile test Debug native cached 37ms MaxRSS:19M
+      +- WriteFile sqlite3.h (reused)
+      +- compile lib sqlite3 Debug native (reused)
+      +- compile lib sqlite3 Debug native (reused)
+      +- WriteFile sqlite3.h (reused)
+      +- compile lib sqlite3 Debug native (reused)
+      +- compile lib sqlite3 Debug native (reused)
+
+error: the following build command failed with exit code 1:
+.zig-cache\o\30bf9a34c20d98ad89a9b1bc618668cf\build.exe 
+D:\downloads\zig-x86_64-windows-0.17.0-dev.261+3d1fb4fac\zig.exe 
+D:\downloads\zig-x86_64-windows-0.17.0-dev.261+3d1fb4fac\lib 
+D:\www\Freelas\_____suissadev\Conceitos\AllasCode\Planes\Data\EventStoreDB-zig .zig-cache C:\Users\Jean 
+Carlo\AppData\Local\zig --seed 0x963093a5 -Z83c9aa12475dba61 test --summary all -j1
