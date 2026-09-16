@@ -105,8 +105,6 @@ const schemaSQL =
     \\CREATE INDEX IF NOT EXISTS idx_events_tx_pos ON events(transaction_position);
     \\CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type);
     \\CREATE INDEX IF NOT EXISTS idx_events_stream_rev ON events(stream_id, event_number);
-    \\CREATE UNIQUE INDEX IF NOT EXISTS idx_events_sequence ON events(sequence) WHERE sequence IS NOT NULL;
-    \\CREATE INDEX IF NOT EXISTS idx_events_tags ON events(tags);
     \\
     \\CREATE TABLE IF NOT EXISTS committed_event_ids (
     \\  event_id BLOB PRIMARY KEY,
@@ -166,10 +164,18 @@ const schemaSQL =
 ;
 
 fn applyMigrations(conn: *Connection) errors.Error!void {
+    // Base DDL deliberately avoids indexes that refer to columns added by a
+    // later migration. Existing v1/v2 files must be able to execute this
+    // block before ALTER TABLE adds their newer columns.
     try conn.exec(schemaSQL);
 
     const current = try conn.queryScalarI64("SELECT COALESCE(MAX(version), 0) FROM schema_info");
-    if (current >= @as(i64, @intCast(schemaVersion))) return;
+    if (current >= @as(i64, @intCast(schemaVersion))) {
+        // Fresh/current databases still need all versioned indexes because
+        // CREATE TABLE above includes the newest columns.
+        try ensureVersionedIndexes(conn);
+        return;
+    }
 
     var v: u32 = @intCast(current + 1);
     while (v <= schemaVersion) : (v += 1) {
@@ -206,6 +212,17 @@ fn applyMigrations(conn: *Connection) errors.Error!void {
         try conn.exec("RELEASE mig");
         try conn.execFmt("INSERT INTO schema_info(version, applied_at) VALUES ({d}, {d})", .{ v, time_mod.nowSec() });
     }
+
+    try ensureVersionedIndexes(conn);
+}
+
+fn ensureVersionedIndexes(conn: *Connection) errors.Error!void {
+    try conn.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_events_sequence ON events(sequence) WHERE sequence IS NOT NULL;");
+    try conn.exec("CREATE INDEX IF NOT EXISTS idx_events_tags ON events(tags);");
+    try conn.exec(
+        \\CREATE INDEX IF NOT EXISTS idx_persistent_acks_frontier
+        \\ON persistent_acks(group_name, stream_id, event_number, acked, parked);
+    );
 }
 
 fn addColumnIfMissing(conn: *Connection, table: []const u8, column: []const u8, col_type: []const u8) errors.Error!void {
