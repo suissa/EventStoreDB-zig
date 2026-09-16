@@ -31,9 +31,6 @@ const Queue = struct {
         defer self.mu.unlock();
         const next_tail = (self.tail + 1) % self.buf.len;
         if (next_tail == self.head) {
-            // Queue is full: free the event's slices before
-            // dropping it. The receiver is too slow; we have
-            // already moved ownership here.
             if (item == .event) freeEvent(self.allocator, &item.event);
             return;
         }
@@ -68,9 +65,6 @@ const Queue = struct {
         self.closed = true;
     }
 
-    /// Free every event slice still buffered. Called after the
-    /// subscription closes so a slow consumer that left events
-    /// queued does not leak them.
     fn drain(self: *Queue) void {
         while (!self.mu.tryLock()) std.atomic.spinLoopHint();
         defer self.mu.unlock();
@@ -101,8 +95,6 @@ const RunContext = struct {
     done: *std.atomic.Value(bool),
 };
 
-/// Subscribe to a single stream. Returns immediately; events
-/// are delivered on the queue returned in `Subscription`.
 pub fn subscribeToStream(
     self: *Client,
     allocator: std.mem.Allocator,
@@ -112,12 +104,6 @@ pub fn subscribeToStream(
     if (self.closed.load(.seq_cst)) return error.DatabaseClosed;
     if (stream_id.len == 0) return error.InvalidArgument;
 
-    // Register the worker with the client *before* spawning, so
-    // a concurrent `close()` waits for this new worker before
-    // tearing down the connection. The race "closed flips
-    // between our load and our increment" is closed by
-    // re-checking `closed` after the increment and rolling back
-    // if we lose to a concurrent close.
     _ = self.active_workers.fetchAdd(1, .seq_cst);
     errdefer _ = self.active_workers.fetchSub(1, .seq_cst);
     if (self.closed.load(.seq_cst)) return error.DatabaseClosed;
@@ -125,8 +111,6 @@ pub fn subscribeToStream(
     const from_rev: i64 = switch (opts.from) {
         .start, .start_backward => 0,
         .end => blk: {
-            // Use a prepared statement so the stream_id is bound,
-            // not concatenated.
             const conn = self.conn;
             const stmt = try bind.prepare(conn.db, conn.allocator, "SELECT revision FROM streams WHERE stream_id = ?");
             defer bind.finalize(conn.allocator, stmt);
@@ -151,10 +135,6 @@ pub fn subscribeToStream(
         .done = done,
     };
 
-    // The RunContext owns its own copy of the stream id so the
-    // receiver can free `sub.stream_id` without invalidating the
-    // worker's read cursor. The worker thread destroys its copy
-    // when it exits.
     const ctx_stream_id = try allocator.dupe(u8, stream_id);
 
     const ctx = try allocator.create(RunContext);
@@ -173,15 +153,12 @@ pub fn subscribeToStream(
     return sub;
 }
 
-/// Subscribe to the global all-stream log.
 pub fn subscribeToAll(
     self: *Client,
     allocator: std.mem.Allocator,
     opts: types.SubscribeOptions,
 ) (errors_mod.Error || std.mem.Allocator.Error || std.Thread.SpawnError)!Subscription {
     if (self.closed.load(.seq_cst)) return error.DatabaseClosed;
-    // Same race-closing pattern as `subscribeToStream` —
-    // see the comment block there for the reasoning.
     _ = self.active_workers.fetchAdd(1, .seq_cst);
     errdefer _ = self.active_workers.fetchSub(1, .seq_cst);
     if (self.closed.load(.seq_cst)) return error.DatabaseClosed;
@@ -203,10 +180,6 @@ pub fn subscribeToAll(
         .done = done,
     };
 
-    // The RunContext owns its own copy of the stream id so the
-    // receiver can free `sub.stream_id` without invalidating the
-    // worker's read cursor. The worker thread destroys its copy
-    // when it exits.
     const ctx_stream_id = try allocator.dupe(u8, "$all");
 
     const ctx = try allocator.create(RunContext);
@@ -233,8 +206,6 @@ pub const Subscription = struct {
     done: *std.atomic.Value(bool),
     closed: bool = false,
 
-    /// Receive the next event. Blocks until one is available
-    /// or the subscription is closed. Returns `null` on close.
     pub fn receive(self: *Subscription) ?types.RecordedEventOrErr {
         while (true) {
             if (self.closed) return null;
@@ -250,22 +221,17 @@ pub const Subscription = struct {
         }
     }
 
-    /// Try to receive without blocking. Returns null if no
-    /// event is immediately available.
     pub fn tryReceive(self: *Subscription) ?types.RecordedEventOrErr {
         if (self.closed) return null;
         return self.queue.tryGet();
     }
 
-    /// Stop the subscription. Safe to call multiple times.
     pub fn close(self: *Subscription) void {
         if (self.closed) return;
         self.closed = true;
         self.queue.close();
         self.done.store(true, .seq_cst);
         if (self.thread) |t| t.join();
-        // After the worker thread is joined, anything left in
-        // the queue is owned by us. Free it.
         self.queue.drain();
         self.allocator.free(self.stream_id);
         self.allocator.destroy(self.queue);
@@ -274,36 +240,23 @@ pub const Subscription = struct {
 };
 
 fn runStream(ctx: *RunContext) void {
-    // Defer ordering matters here: Zig defers are LIFO, so
-    // the LAST-declared defer runs FIRST. We want at exit:
-    //
-    //   1. decrement `active_workers`     <-- declared LAST
-    //   2. unregister the Waiter          <-- declared 3rd
-    //   3. free `ctx.stream_id`           <-- declared 2nd
-    //   4. destroy `ctx`                  <-- declared 1st
-    //
-    // The previous version declared them in the opposite
-    // order and segfaulted: `destroy(ctx)` ran first, after
-    // which `ctx.client.active_workers.fetchSub` and
-    // `ctx.allocator.free(ctx.stream_id)` both read through
-    // the freed ctx pointer.
     var cursor: i64 = ctx.from_rev;
-    const waiter = ctx.client.waker.register() catch return;
+
+    // Install lifetime bookkeeping before registration. If the
+    // waiter allocation fails, the worker must still decrement the
+    // Client counter and release its context; otherwise Client.close()
+    // can wait forever for a worker that already returned.
     defer ctx.allocator.destroy(ctx);
     defer ctx.allocator.free(ctx.stream_id);
-    defer ctx.client.waker.unregister(waiter);
     defer _ = ctx.client.active_workers.fetchSub(1, .seq_cst);
 
-    // Bail out promptly if the client was already closed before the
-    // worker even spun up. Otherwise we touch `self.client.conn` on a
-    // destroyed connection and segfault.
-    //
-    // Subscription reads are routed through `Client.read_conn`
-    // (set in `Client.open`). When the caller enabled
-    // `OpenOptions.separate_read_connection`, `read_conn` is
-    // its own SQLite file handle and writers on `conn` no
-    // longer block this worker — addressing the v0.1 stress
-    // test's 500–800-of-1 000 delivery race.
+    const waiter = ctx.client.waker.register() catch {
+        ctx.done.store(true, .seq_cst);
+        ctx.queue.close();
+        return;
+    };
+    defer ctx.client.waker.unregister(waiter);
+
     while (!ctx.done.load(.seq_cst) and !ctx.client.closed.load(.seq_cst)) {
         const res = readStreamOnConn(
             ctx.client,
@@ -316,10 +269,6 @@ fn runStream(ctx: *RunContext) void {
             continue;
         };
 
-        // `readStream` returns an owned `[]RecordedEvent` (the outer
-        // array). The inner slices on each row are shared with the
-        // queue (which now owns them); the outer array is ours to
-        // free after the for-loop hands ownership over.
         const outer = res.events;
         if (outer.len == 0) {
             if (res.is_end_of_stream) {
@@ -340,13 +289,18 @@ fn runStream(ctx: *RunContext) void {
 }
 
 fn runAll(ctx: *RunContext) void {
-    // See `runStream` for the LIFO defer-order rationale.
     var cursor: u64 = ctx.from_pos_commit;
-    const waiter = ctx.client.waker.register() catch return;
+
     defer ctx.allocator.destroy(ctx);
     defer ctx.allocator.free(ctx.stream_id);
-    defer ctx.client.waker.unregister(waiter);
     defer _ = ctx.client.active_workers.fetchSub(1, .seq_cst);
+
+    const waiter = ctx.client.waker.register() catch {
+        ctx.done.store(true, .seq_cst);
+        ctx.queue.close();
+        return;
+    };
+    defer ctx.client.waker.unregister(waiter);
 
     while (!ctx.done.load(.seq_cst) and !ctx.client.closed.load(.seq_cst)) {
         const res = readAllOnConn(
